@@ -52,6 +52,7 @@ namespace Meta3DScanner
         public event Action<string> OnSessionStarted;
         public event Action<int> OnFrameSent;
         public event Action<FrameFeedback> OnFrameFeedback;
+        public event Action<Vector3[]> OnPointDataReceived;
         public event Action<string> OnError;
 
         public bool IsConnected => isConnected;
@@ -69,6 +70,7 @@ namespace Meta3DScanner
             public float brightness;
             public string[] quality_issues;
             public int total_frames;
+            public float[] point_positions; // Flattened Vec3 array from server (x,y,z,x,y,z,...)
         }
 
         [Serializable]
@@ -86,6 +88,7 @@ namespace Meta3DScanner
             public float blur_score;
             public float brightness;
             public string[] quality_issues;
+            public float[] point_positions; // Flattened Vec3 array
         }
 
         private void Start()
@@ -221,9 +224,26 @@ namespace Meta3DScanner
                                 blur_score = msg.blur_score,
                                 brightness = msg.brightness,
                                 quality_issues = msg.quality_issues,
-                                total_frames = msg.total_frames
+                                total_frames = msg.total_frames,
+                                point_positions = msg.point_positions
                             };
                             OnFrameFeedback?.Invoke(feedback);
+
+                            // Parse and emit point data if available
+                            if (msg.point_positions != null && msg.point_positions.Length >= 3)
+                            {
+                                int pointCount = msg.point_positions.Length / 3;
+                                Vector3[] points = new Vector3[pointCount];
+                                for (int i = 0; i < pointCount; i++)
+                                {
+                                    points[i] = new Vector3(
+                                        msg.point_positions[i * 3],
+                                        msg.point_positions[i * 3 + 1],
+                                        msg.point_positions[i * 3 + 2]
+                                    );
+                                }
+                                OnPointDataReceived?.Invoke(points);
+                            }
                         }
                         break;
 

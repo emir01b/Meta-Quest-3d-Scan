@@ -11,6 +11,7 @@
 using System;
 using System.Collections;
 using UnityEngine;
+using UnityEngine.UI;
 
 namespace Meta3DScanner
 {
@@ -34,6 +35,9 @@ namespace Meta3DScanner
         private Texture2D captureTexture;
         private bool isCapturing = false;
         private int frameIndex = 0;
+
+        // OVR head tracking reference
+        private OVRCameraRig ovrCameraRig;
 
         // Camera intrinsics (will be set from Quest API)
         private float focalLengthX = 600f;
@@ -70,6 +74,9 @@ namespace Meta3DScanner
 
         private void Start()
         {
+            // Find OVRCameraRig for head pose tracking
+            ovrCameraRig = FindObjectOfType<OVRCameraRig>();
+
             // Request camera permission on Quest
             StartCoroutine(RequestCameraPermission());
         }
@@ -241,7 +248,23 @@ namespace Meta3DScanner
         private float[] GetHeadPoseMatrix()
         {
             // Get the center eye anchor / head transform
-            Transform headTransform = Camera.main.transform;
+            // Prefer OVRCameraRig if available
+            Transform headTransform = null;
+            if (ovrCameraRig != null && ovrCameraRig.centerEyeAnchor != null)
+            {
+                headTransform = ovrCameraRig.centerEyeAnchor;
+            }
+            else
+            {
+                Camera mainCam = Camera.main;
+                if (mainCam != null) headTransform = mainCam.transform;
+            }
+
+            if (headTransform == null)
+            {
+                Debug.LogWarning("[Meta3D] No camera transform found for head pose");
+                return new float[16];
+            }
 
             Matrix4x4 poseMatrix = Matrix4x4.TRS(
                 headTransform.position,

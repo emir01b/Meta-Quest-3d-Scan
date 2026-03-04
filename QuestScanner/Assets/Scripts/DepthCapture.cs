@@ -19,6 +19,9 @@ namespace Meta3DScanner
         [SerializeField] private bool captureDepth = true;
         [SerializeField] private bool useEnvironmentDepth = true; // Uses Meta Depth API
 
+        [Header("References (Auto-found if empty)")]
+        [SerializeField] private OVRCameraRig ovrCameraRig;
+
         [Header("Debug")]
         [SerializeField] private bool showDepthVisualization = false;
 
@@ -36,6 +39,10 @@ namespace Meta3DScanner
 
         private void Start()
         {
+            if (ovrCameraRig == null)
+            {
+                ovrCameraRig = FindObjectOfType<OVRCameraRig>();
+            }
             InitializeDepth();
         }
 
@@ -62,8 +69,17 @@ namespace Meta3DScanner
             // and EnvironmentDepthTextureProvider components.
             // These should be set up in the Unity scene.
 
-            // Check if the depth manager is available
-            var depthManager = FindObjectOfType<OVRManager>();
+            // Check if the OVRManager is available (present on OVRCameraRig)
+            OVRManager depthManager = null;
+            if (ovrCameraRig != null)
+            {
+                depthManager = ovrCameraRig.GetComponent<OVRManager>();
+            }
+            if (depthManager == null)
+            {
+                depthManager = FindObjectOfType<OVRManager>();
+            }
+
             if (depthManager != null)
             {
                 Debug.Log("[Meta3D] OVRManager found, Depth API should be available");
@@ -177,7 +193,16 @@ namespace Meta3DScanner
         /// </summary>
         private byte[] CaptureFallbackDepth()
         {
-            Camera cam = Camera.main;
+            // Get camera from OVRCameraRig or fallback to Camera.main
+            Camera cam = null;
+            if (ovrCameraRig != null && ovrCameraRig.centerEyeAnchor != null)
+            {
+                cam = ovrCameraRig.centerEyeAnchor.GetComponent<Camera>();
+            }
+            if (cam == null)
+            {
+                cam = Camera.main;
+            }
             if (cam == null) return null;
 
             // Enable depth texture generation

@@ -1,18 +1,16 @@
 /*
- * Meta3D Scanner - Hand UI Manager
- * Creates and manages a World Space Canvas attached to the left controller.
- * Contains server connection UI, scan controls, and status display.
- * 
- * Hierarchy: OVRCameraRig > TrackingSpace > LeftHandAnchor > UI Canvas
+ * MetaScan — Hand UI Manager
+ * Creates a World Space Canvas attached to the left controller.
+ * Panel is visible while left grip is held down.
+ * Uses only built-in Unity UI (no TMPro dependency).
  */
 
 using System;
 using UnityEngine;
 using UnityEngine.UI;
 using UnityEngine.EventSystems;
-using TMPro;
 
-namespace Meta3DScanner
+namespace MetaScan
 {
     public class HandUIManager : MonoBehaviour
     {
@@ -20,484 +18,430 @@ namespace Meta3DScanner
         [SerializeField] private ControllerManager controllerManager;
 
         [Header("UI Settings")]
-        [SerializeField] private float canvasWidth = 0.3f;   // 30cm wide
-        [SerializeField] private float canvasHeight = 0.22f;  // 22cm tall
-        [SerializeField] private float canvasScale = 0.001f;  // World scale multiplier
+        [SerializeField] private float canvasWidth = 0.32f;
+        [SerializeField] private float canvasHeight = 0.26f;
+        [SerializeField] private float canvasScale = 0.001f;
         [SerializeField] private Vector3 canvasOffset = new Vector3(0.05f, 0.1f, -0.08f);
         [SerializeField] private Vector3 canvasRotation = new Vector3(30f, 0f, 0f);
 
         [Header("Colors")]
-        [SerializeField] private Color panelColor = new Color(0.05f, 0.05f, 0.12f, 0.92f);
-        [SerializeField] private Color accentColor = new Color(0.0f, 0.75f, 1.0f, 1.0f);
+        [SerializeField] private Color panelColor = new Color(0.05f, 0.05f, 0.12f, 0.94f);
+        [SerializeField] private Color accentColor = new Color(0.39f, 0.40f, 0.95f, 1.0f);
         [SerializeField] private Color successColor = new Color(0.2f, 0.9f, 0.4f, 1.0f);
         [SerializeField] private Color warningColor = new Color(1.0f, 0.8f, 0.2f, 1.0f);
         [SerializeField] private Color errorColor = new Color(1.0f, 0.3f, 0.3f, 1.0f);
 
-        // UI elements (created at runtime)
+        // UI elements
         private Canvas uiCanvas;
         private GameObject canvasObject;
 
-        // Connection section
-        private TMP_InputField ipInputField;
-        private TMP_InputField portInputField;
+        private InputField ipInputField;
+        private InputField portInputField;
         private Button connectButton;
-        private TextMeshProUGUI connectButtonText;
+        private Text connectButtonText;
         private Image connectionIndicator;
 
-        // Scan section
+        private Button selectObjectButton;
         private Button scanButton;
         private Button stopButton;
-        private TextMeshProUGUI scanButtonText;
-        private TextMeshProUGUI stopButtonText;
 
-        // Status section
-        private TextMeshProUGUI statusText;
-        private TextMeshProUGUI frameCountText;
-        private TextMeshProUGUI qualityText;
-        private TextMeshProUGUI instructionText;
+        private Text statusText;
+        private Text frameCountText;
+        private Text qualityText;
+        private Text instructionText;
         private Slider progressBar;
-
-        // Event System
-        private EventSystem eventSystem;
 
         // Events
         public event Action<string, int> OnConnectRequested;
+        public event Action OnSelectObjectRequested;
         public event Action OnScanRequested;
         public event Action OnStopRequested;
 
-        // State
-        private bool isUIVisible = true;
+        private bool isUIVisible = false; // Starts hidden
 
-        // Public accessors for UI elements
-        public TextMeshProUGUI StatusText => statusText;
-        public TextMeshProUGUI FrameCountText => frameCountText;
-        public TextMeshProUGUI QualityText => qualityText;
-        public TextMeshProUGUI InstructionText => instructionText;
-        public Slider ProgressBar => progressBar;
-        public Image ConnectionIndicator => connectionIndicator;
-        public Button ScanButton => scanButton;
-        public Button StopButton => stopButton;
-        public Button ConnectButton => connectButton;
+        // Public accessors
         public Canvas UICanvas => uiCanvas;
 
         private void Start()
         {
             if (controllerManager == null)
-            {
-                controllerManager = FindObjectOfType<ControllerManager>();
-            }
+                controllerManager = FindFirstObjectByType<ControllerManager>();
 
             CreateUI();
+
+            // Delay event system setup by one frame so OVRCameraRig anchors are ready
+            StartCoroutine(DelayedSetup());
+
+            // Subscribe to grip events for hold-to-show
+            if (controllerManager != null)
+            {
+                controllerManager.OnLeftGripDown += OnLeftGripDown;
+                controllerManager.OnLeftGripUp += OnLeftGripUp;
+            }
+
+            // Start hidden
+            SetVisible(false);
+        }
+
+        private System.Collections.IEnumerator DelayedSetup()
+        {
+            yield return null; // Wait one frame for all components to initialize
             SetupEventSystem();
         }
 
-        /// <summary>
-        /// Create the entire UI hierarchy at runtime.
-        /// </summary>
+        private void OnLeftGripDown()
+        {
+            SetVisible(true);
+        }
+
+        private void OnLeftGripUp()
+        {
+            SetVisible(false);
+        }
+
+        // =========================================================
+        // UI Creation
+        // =========================================================
+
         private void CreateUI()
         {
             Transform leftAnchor = null;
 
-            // Find left hand anchor
             if (controllerManager != null && controllerManager.LeftHandAnchor != null)
             {
                 leftAnchor = controllerManager.LeftHandAnchor;
             }
+#if META_XR_SDK
             else
             {
-                OVRCameraRig cameraRig = FindObjectOfType<OVRCameraRig>();
+                OVRCameraRig cameraRig = FindFirstObjectByType<OVRCameraRig>();
                 if (cameraRig != null)
-                {
                     leftAnchor = cameraRig.leftHandAnchor;
-                }
             }
+#endif
 
             if (leftAnchor == null)
             {
-                Debug.LogError("[Meta3D-UI] Left hand anchor not found! UI cannot be attached.");
-                return;
+                Debug.LogWarning("[MetaScan-UI] Left hand anchor not found. Using camera fallback.");
+                Camera cam = Camera.main;
+                if (cam != null)
+                {
+                    GameObject anchorObj = new GameObject("FallbackLeftAnchor");
+                    anchorObj.transform.SetParent(cam.transform, false);
+                    anchorObj.transform.localPosition = new Vector3(-0.3f, -0.2f, 0.5f);
+                    leftAnchor = anchorObj.transform;
+                }
+                else
+                {
+                    Debug.LogError("[MetaScan-UI] No camera found. Cannot create UI.");
+                    return;
+                }
             }
 
-            // Create Canvas GameObject as child of left hand anchor
-            canvasObject = new GameObject("ScannerUI_Canvas");
+            // Create Canvas
+            canvasObject = new GameObject("MetaScan_UICanvas");
             canvasObject.transform.SetParent(leftAnchor, false);
             canvasObject.transform.localPosition = canvasOffset;
             canvasObject.transform.localRotation = Quaternion.Euler(canvasRotation);
             canvasObject.transform.localScale = Vector3.one * canvasScale;
 
-            // Add Canvas component
             uiCanvas = canvasObject.AddComponent<Canvas>();
             uiCanvas.renderMode = RenderMode.WorldSpace;
             uiCanvas.sortingOrder = 100;
 
-            // Set canvas size
             RectTransform canvasRect = canvasObject.GetComponent<RectTransform>();
             canvasRect.sizeDelta = new Vector2(canvasWidth / canvasScale, canvasHeight / canvasScale);
 
-            // Add CanvasScaler
             CanvasScaler scaler = canvasObject.AddComponent<CanvasScaler>();
             scaler.dynamicPixelsPerUnit = 10;
             scaler.referencePixelsPerUnit = 100;
 
-            // Add GraphicRaycaster for VR interaction
-            GraphicRaycaster raycaster = canvasObject.AddComponent<GraphicRaycaster>();
+#if META_XR_SDK
+            // BoxCollider for VRUIPointer's Physics.Raycast to detect canvas hits
+            BoxCollider canvasCollider = canvasObject.AddComponent<BoxCollider>();
+            Vector2 canvasSize = canvasRect.sizeDelta;
+            canvasCollider.size = new Vector3(canvasSize.x, canvasSize.y, 1f);
+            canvasCollider.center = Vector3.zero;
+#endif
+            canvasObject.AddComponent<GraphicRaycaster>();
 
-            // Try to add OVRRaycaster if available (Meta SDK interaction)
-            // This will work with VR controllers to interact with UI
-            try
-            {
-                var ovrRaycaster = canvasObject.AddComponent<OVRRaycaster>();
-                if (ovrRaycaster != null)
-                {
-                    // Prefer OVRRaycaster, disable standard raycaster
-                    raycaster.enabled = false;
-                }
-            }
-            catch
-            {
-                // OVRRaycaster not available, use standard GraphicRaycaster
-                Debug.Log("[Meta3D-UI] OVRRaycaster not available, using standard raycaster");
-            }
-
-            // Build UI elements
+            // Build UI sections
             CreateBackground(canvasRect);
             CreateConnectionSection(canvasRect);
-            CreateScanSection(canvasRect);
+            CreateActionSection(canvasRect);
             CreateStatusSection(canvasRect);
 
-            Debug.Log("[Meta3D-UI] Hand UI created and attached to left controller");
+            Debug.Log("[MetaScan-UI] Hand UI created and attached to left controller");
         }
 
         private void CreateBackground(RectTransform parent)
         {
-            GameObject bgObj = new GameObject("Background");
-            bgObj.transform.SetParent(parent, false);
-
+            GameObject bgObj = CreateUIObj("Background", parent);
             Image bg = bgObj.AddComponent<Image>();
             bg.color = panelColor;
+            StretchFill(bgObj);
 
-            RectTransform bgRect = bgObj.GetComponent<RectTransform>();
-            bgRect.anchorMin = Vector2.zero;
-            bgRect.anchorMax = Vector2.one;
-            bgRect.offsetMin = Vector2.zero;
-            bgRect.offsetMax = Vector2.zero;
-
-            // Add rounded corners effect via another layer
-            GameObject borderObj = new GameObject("Border");
-            borderObj.transform.SetParent(bgObj.transform, false);
-
+            // Accent border
+            GameObject borderObj = CreateUIObj("Border", bgObj.transform);
             Image border = borderObj.AddComponent<Image>();
-            border.color = accentColor * 0.5f;
-
+            border.color = accentColor * 0.4f;
             RectTransform borderRect = borderObj.GetComponent<RectTransform>();
             borderRect.anchorMin = Vector2.zero;
             borderRect.anchorMax = Vector2.one;
             borderRect.offsetMin = new Vector2(-2, -2);
             borderRect.offsetMax = new Vector2(2, 2);
-
-            // Move border behind background
             borderObj.transform.SetAsFirstSibling();
         }
 
         private void CreateConnectionSection(RectTransform parent)
         {
-            float panelWidth = parent.sizeDelta.x;
-            float panelHeight = parent.sizeDelta.y;
-            float padding = 8f;
+            float w = parent.sizeDelta.x;
+            float h = parent.sizeDelta.y;
+            float pad = 8f;
 
             // Title
-            CreateLabel(parent, "Meta3D Scanner", 18, accentColor,
-                new Vector2(padding, panelHeight - 30f),
-                new Vector2(panelWidth - padding * 2, 24f),
-                TextAlignmentOptions.Center);
+            CreateLabel(parent, "MetaScan", 18, accentColor,
+                new Vector2(pad, 6f), new Vector2(w - pad * 2, 24f), TextAnchor.MiddleCenter);
 
-            // IP Input Field
-            CreateLabel(parent, "Sunucu IP:", 10, Color.gray,
-                new Vector2(padding, panelHeight - 52f),
-                new Vector2(60f, 16f),
-                TextAlignmentOptions.Left);
+            // Subtitle
+            CreateLabel(parent, "3D Object Scanner", 9, new Color(0.6f, 0.6f, 0.7f),
+                new Vector2(pad, 28f), new Vector2(w - pad * 2, 14f), TextAnchor.MiddleCenter);
 
-            ipInputField = CreateInputField(parent, "192.168.1.100",
-                new Vector2(70f, panelHeight - 54f),
-                new Vector2(panelWidth - 70f - padding - 55f, 20f));
-
-            // Port Input Field
-            portInputField = CreateInputField(parent, "8765",
-                new Vector2(panelWidth - padding - 50f, panelHeight - 54f),
-                new Vector2(50f, 20f));
-
-            // Connection Indicator
-            GameObject indicatorObj = new GameObject("ConnectionIndicator");
-            indicatorObj.transform.SetParent(parent, false);
-            connectionIndicator = indicatorObj.AddComponent<Image>();
+            // Connection indicator dot
+            GameObject indObj = CreateUIObj("ConnectionDot", parent);
+            connectionIndicator = indObj.AddComponent<Image>();
             connectionIndicator.color = errorColor;
-            RectTransform indRect = indicatorObj.GetComponent<RectTransform>();
-            indRect.anchorMin = new Vector2(0, 1);
-            indRect.anchorMax = new Vector2(0, 1);
-            indRect.pivot = new Vector2(0, 1);
-            indRect.anchoredPosition = new Vector2(padding, -7f);
-            indRect.sizeDelta = new Vector2(8f, 8f);
+            SetRect(indObj, new Vector2(pad, 48f), new Vector2(8f, 8f));
 
-            // Connect Button
-            connectButton = CreateButton(parent, "Bağlan", accentColor,
-                new Vector2(padding, panelHeight - 82f),
-                new Vector2(panelWidth - padding * 2, 24f));
-            connectButtonText = connectButton.GetComponentInChildren<TextMeshProUGUI>();
-            connectButton.onClick.AddListener(OnConnectButtonClicked);
+            // IP label
+            CreateLabel(parent, "IP:", 10, Color.gray,
+                new Vector2(pad + 12f, 46f), new Vector2(20f, 14f), TextAnchor.MiddleLeft);
+
+            // IP Input
+            ipInputField = CreateInput(parent, "192.168.1.100",
+                new Vector2(pad + 32f, 44f), new Vector2(w - pad * 2 - 32f - 56f, 20f));
+
+            // Port Input
+            portInputField = CreateInput(parent, "8765",
+                new Vector2(w - pad - 52f, 44f), new Vector2(52f, 20f));
+
+            // Connect button
+            connectButton = CreateBtn(parent, "Baglan", accentColor,
+                new Vector2(pad, 70f), new Vector2(w - pad * 2, 24f));
+            connectButtonText = connectButton.GetComponentInChildren<Text>();
+            connectButton.onClick.AddListener(OnConnectClicked);
         }
 
-        private void CreateScanSection(RectTransform parent)
+        private void CreateActionSection(RectTransform parent)
         {
-            float panelWidth = parent.sizeDelta.x;
-            float panelHeight = parent.sizeDelta.y;
-            float padding = 8f;
-            float yPos = panelHeight - 114f;
-            float buttonWidth = (panelWidth - padding * 3) / 2f;
+            float w = parent.sizeDelta.x;
+            float pad = 8f;
+            float y = 102f;
+            float bw = (w - pad * 4) / 3f;
 
-            // Scan Button
-            scanButton = CreateButton(parent, "▶ Tara", successColor,
-                new Vector2(padding, yPos),
-                new Vector2(buttonWidth, 28f));
-            scanButtonText = scanButton.GetComponentInChildren<TextMeshProUGUI>();
-            scanButton.onClick.AddListener(OnScanButtonClicked);
+            // Select Object button
+            selectObjectButton = CreateBtn(parent, "Cisim Sec", warningColor,
+                new Vector2(pad, y), new Vector2(bw, 28f));
+            selectObjectButton.onClick.AddListener(OnSelectObjectClicked);
+            selectObjectButton.interactable = false;
+
+            // Scan button
+            scanButton = CreateBtn(parent, ">> Tara", successColor,
+                new Vector2(pad * 2 + bw, y), new Vector2(bw, 28f));
+            scanButton.onClick.AddListener(OnScanClicked);
             scanButton.interactable = false;
 
-            // Stop Button
-            stopButton = CreateButton(parent, "■ Dur", errorColor,
-                new Vector2(padding * 2 + buttonWidth, yPos),
-                new Vector2(buttonWidth, 28f));
-            stopButtonText = stopButton.GetComponentInChildren<TextMeshProUGUI>();
-            stopButton.onClick.AddListener(OnStopButtonClicked);
+            // Stop button
+            stopButton = CreateBtn(parent, "[] Dur", errorColor,
+                new Vector2(pad * 3 + bw * 2, y), new Vector2(bw, 28f));
+            stopButton.onClick.AddListener(OnStopClicked);
             stopButton.interactable = false;
         }
 
         private void CreateStatusSection(RectTransform parent)
         {
-            float panelWidth = parent.sizeDelta.x;
-            float panelHeight = parent.sizeDelta.y;
-            float padding = 8f;
-            float yStart = panelHeight - 152f;
+            float w = parent.sizeDelta.x;
+            float pad = 8f;
+            float y = 140f;
 
-            // Status Text
-            statusText = CreateLabel(parent, "Hazır", 12, Color.white,
-                new Vector2(padding, yStart),
-                new Vector2(panelWidth - padding * 2, 16f),
-                TextAlignmentOptions.Left);
+            statusText = CreateLabel(parent, "Hazir", 12, Color.white,
+                new Vector2(pad, y), new Vector2(w - pad * 2, 16f), TextAnchor.MiddleLeft);
 
-            // Frame Count
             frameCountText = CreateLabel(parent, "Frame: 0 / 200", 10, Color.gray,
-                new Vector2(padding, yStart - 18f),
-                new Vector2(panelWidth / 2f, 14f),
-                TextAlignmentOptions.Left);
+                new Vector2(pad, y + 18f), new Vector2(w / 2f, 14f), TextAnchor.MiddleLeft);
 
-            // Quality Text
-            qualityText = CreateLabel(parent, "Kalite: —", 10, Color.gray,
-                new Vector2(panelWidth / 2f, yStart - 18f),
-                new Vector2(panelWidth / 2f - padding, 14f),
-                TextAlignmentOptions.Right);
+            qualityText = CreateLabel(parent, "Kalite: --", 10, Color.gray,
+                new Vector2(w / 2f, y + 18f), new Vector2(w / 2f - pad, 14f), TextAnchor.MiddleRight);
 
-            // Instruction Text
-            instructionText = CreateLabel(parent, "Sunucuya bağlanmak için Bağlan'a basın", 9, warningColor,
-                new Vector2(padding, yStart - 36f),
-                new Vector2(panelWidth - padding * 2, 24f),
-                TextAlignmentOptions.Center);
+            instructionText = CreateLabel(parent, "Sol gribi basili tut = panel", 9, warningColor,
+                new Vector2(pad, y + 36f), new Vector2(w - pad * 2, 24f), TextAnchor.MiddleCenter);
 
-            // Progress Bar
-            progressBar = CreateProgressBar(parent,
-                new Vector2(padding, yStart - 64f),
-                new Vector2(panelWidth - padding * 2, 8f));
+            progressBar = CreateProgressSlider(parent,
+                new Vector2(pad, y + 64f), new Vector2(w - pad * 2, 8f));
         }
 
         // =========================================================
-        // UI Element Creators
+        // UI Helper Methods
         // =========================================================
 
-        private TextMeshProUGUI CreateLabel(RectTransform parent, string text, float fontSize,
-            Color color, Vector2 position, Vector2 size, TextAlignmentOptions alignment)
+        private GameObject CreateUIObj(string name, Transform parent)
         {
-            GameObject obj = new GameObject("Label_" + text);
+            GameObject obj = new GameObject(name);
             obj.transform.SetParent(parent, false);
-
-            TextMeshProUGUI tmp = obj.AddComponent<TextMeshProUGUI>();
-            tmp.text = text;
-            tmp.fontSize = fontSize;
-            tmp.color = color;
-            tmp.alignment = alignment;
-            tmp.enableAutoSizing = false;
-            tmp.overflowMode = TextOverflowModes.Ellipsis;
-
-            RectTransform rect = obj.GetComponent<RectTransform>();
-            rect.anchorMin = new Vector2(0, 1);
-            rect.anchorMax = new Vector2(0, 1);
-            rect.pivot = new Vector2(0, 1);
-            rect.anchoredPosition = new Vector2(position.x, -position.y + parent.sizeDelta.y);
-            rect.sizeDelta = size;
-
-            return tmp;
+            return obj;
         }
 
-        private TMP_InputField CreateInputField(RectTransform parent, string placeholder,
+        private void StretchFill(GameObject obj)
+        {
+            RectTransform r = obj.GetComponent<RectTransform>();
+            if (r == null) r = obj.AddComponent<RectTransform>();
+            r.anchorMin = Vector2.zero;
+            r.anchorMax = Vector2.one;
+            r.offsetMin = Vector2.zero;
+            r.offsetMax = Vector2.zero;
+        }
+
+        private void SetRect(GameObject obj, Vector2 pos, Vector2 size)
+        {
+            RectTransform r = obj.GetComponent<RectTransform>();
+            if (r == null) r = obj.AddComponent<RectTransform>();
+            r.anchorMin = new Vector2(0, 1);
+            r.anchorMax = new Vector2(0, 1);
+            r.pivot = new Vector2(0, 1);
+            r.anchoredPosition = new Vector2(pos.x, -pos.y);
+            r.sizeDelta = size;
+        }
+
+        private Text CreateLabel(RectTransform parent, string text, int fontSize,
+            Color color, Vector2 position, Vector2 size, TextAnchor alignment)
+        {
+            string safeName = text.Length > 12 ? text.Substring(0, 12) : text;
+            GameObject obj = CreateUIObj("Lbl_" + safeName, parent);
+            Text t = obj.AddComponent<Text>();
+            t.text = text;
+            t.fontSize = fontSize;
+            t.color = color;
+            t.alignment = alignment;
+            t.horizontalOverflow = HorizontalWrapMode.Overflow;
+            t.verticalOverflow = VerticalWrapMode.Overflow;
+            t.font = Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf");
+
+            SetRect(obj, position, size);
+            return t;
+        }
+
+        private InputField CreateInput(RectTransform parent, string defaultText,
             Vector2 position, Vector2 size)
         {
-            GameObject obj = new GameObject("InputField");
-            obj.transform.SetParent(parent, false);
-
+            GameObject obj = CreateUIObj("Input", parent);
             Image bg = obj.AddComponent<Image>();
             bg.color = new Color(0.15f, 0.15f, 0.2f, 1f);
+            SetRect(obj, position, size);
 
-            RectTransform rect = obj.GetComponent<RectTransform>();
-            rect.anchorMin = new Vector2(0, 1);
-            rect.anchorMax = new Vector2(0, 1);
-            rect.pivot = new Vector2(0, 1);
-            rect.anchoredPosition = new Vector2(position.x, -position.y + parent.sizeDelta.y);
-            rect.sizeDelta = size;
-
-            // Text area
-            GameObject textArea = new GameObject("TextArea");
-            textArea.transform.SetParent(obj.transform, false);
-            RectTransform textAreaRect = textArea.AddComponent<RectTransform>();
-            textAreaRect.anchorMin = Vector2.zero;
-            textAreaRect.anchorMax = Vector2.one;
-            textAreaRect.offsetMin = new Vector2(4, 2);
-            textAreaRect.offsetMax = new Vector2(-4, -2);
-            RectMask2D mask = textArea.AddComponent<RectMask2D>();
-
-            // Input text
-            GameObject textObj = new GameObject("Text");
-            textObj.transform.SetParent(textArea.transform, false);
-            TextMeshProUGUI inputText = textObj.AddComponent<TextMeshProUGUI>();
+            // Text child
+            GameObject textObj = CreateUIObj("Text", obj.transform);
+            Text inputText = textObj.AddComponent<Text>();
             inputText.fontSize = 10;
             inputText.color = Color.white;
-            inputText.alignment = TextAlignmentOptions.Left;
-            inputText.richText = false;
+            inputText.alignment = TextAnchor.MiddleLeft;
+            inputText.supportRichText = false;
+            inputText.font = Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf");
 
             RectTransform textRect = textObj.GetComponent<RectTransform>();
             textRect.anchorMin = Vector2.zero;
             textRect.anchorMax = Vector2.one;
-            textRect.offsetMin = Vector2.zero;
-            textRect.offsetMax = Vector2.zero;
+            textRect.offsetMin = new Vector2(4, 2);
+            textRect.offsetMax = new Vector2(-4, -2);
 
             // Placeholder
-            GameObject phObj = new GameObject("Placeholder");
-            phObj.transform.SetParent(textArea.transform, false);
-            TextMeshProUGUI phText = phObj.AddComponent<TextMeshProUGUI>();
-            phText.text = placeholder;
+            GameObject phObj = CreateUIObj("Placeholder", obj.transform);
+            Text phText = phObj.AddComponent<Text>();
+            phText.text = defaultText;
             phText.fontSize = 10;
             phText.color = new Color(1f, 1f, 1f, 0.3f);
-            phText.fontStyle = FontStyles.Italic;
-            phText.alignment = TextAlignmentOptions.Left;
+            phText.fontStyle = FontStyle.Italic;
+            phText.alignment = TextAnchor.MiddleLeft;
+            phText.font = Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf");
 
             RectTransform phRect = phObj.GetComponent<RectTransform>();
             phRect.anchorMin = Vector2.zero;
             phRect.anchorMax = Vector2.one;
-            phRect.offsetMin = Vector2.zero;
-            phRect.offsetMax = Vector2.zero;
+            phRect.offsetMin = new Vector2(4, 2);
+            phRect.offsetMax = new Vector2(-4, -2);
 
-            // Add TMP_InputField
-            TMP_InputField inputField = obj.AddComponent<TMP_InputField>();
-            inputField.textViewport = textAreaRect;
-            inputField.textComponent = inputText;
-            inputField.placeholder = phText;
-            inputField.text = placeholder;
-            inputField.pointSize = 10;
+            InputField field = obj.AddComponent<InputField>();
+            field.textComponent = inputText;
+            field.placeholder = phText;
+            field.text = defaultText;
 
-            return inputField;
+            return field;
         }
 
-        private Button CreateButton(RectTransform parent, string label, Color color,
+        private Button CreateBtn(RectTransform parent, string label, Color color,
             Vector2 position, Vector2 size)
         {
-            GameObject obj = new GameObject("Button_" + label);
-            obj.transform.SetParent(parent, false);
-
+            GameObject obj = CreateUIObj("Btn_" + label, parent);
             Image bg = obj.AddComponent<Image>();
             bg.color = color;
-
-            RectTransform rect = obj.GetComponent<RectTransform>();
-            rect.anchorMin = new Vector2(0, 1);
-            rect.anchorMax = new Vector2(0, 1);
-            rect.pivot = new Vector2(0, 1);
-            rect.anchoredPosition = new Vector2(position.x, -position.y + parent.sizeDelta.y);
-            rect.sizeDelta = size;
+            SetRect(obj, position, size);
 
             Button btn = obj.AddComponent<Button>();
-            ColorBlock colors = btn.colors;
-            colors.normalColor = color;
-            colors.highlightedColor = color * 1.2f;
-            colors.pressedColor = color * 0.8f;
-            colors.disabledColor = color * 0.4f;
-            colors.fadeDuration = 0.1f;
-            btn.colors = colors;
+            ColorBlock cb = btn.colors;
+            cb.normalColor = color;
+            cb.highlightedColor = color * 1.2f;
+            cb.pressedColor = color * 0.8f;
+            cb.disabledColor = color * 0.3f;
+            cb.fadeDuration = 0.1f;
+            btn.colors = cb;
 
-            // Button label text
-            GameObject textObj = new GameObject("Label");
-            textObj.transform.SetParent(obj.transform, false);
-            TextMeshProUGUI tmp = textObj.AddComponent<TextMeshProUGUI>();
-            tmp.text = label;
-            tmp.fontSize = 11;
-            tmp.color = Color.white;
-            tmp.alignment = TextAlignmentOptions.Center;
-            tmp.fontStyle = FontStyles.Bold;
-
-            RectTransform textRect = textObj.GetComponent<RectTransform>();
-            textRect.anchorMin = Vector2.zero;
-            textRect.anchorMax = Vector2.one;
-            textRect.offsetMin = Vector2.zero;
-            textRect.offsetMax = Vector2.zero;
+            // Label
+            GameObject textObj = CreateUIObj("Label", obj.transform);
+            Text t = textObj.AddComponent<Text>();
+            t.text = label;
+            t.fontSize = 11;
+            t.color = Color.white;
+            t.alignment = TextAnchor.MiddleCenter;
+            t.fontStyle = FontStyle.Bold;
+            t.font = Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf");
+            StretchFill(textObj);
 
             return btn;
         }
 
-        private Slider CreateProgressBar(RectTransform parent, Vector2 position, Vector2 size)
+        private Slider CreateProgressSlider(RectTransform parent, Vector2 position, Vector2 size)
         {
-            GameObject obj = new GameObject("ProgressBar");
-            obj.transform.SetParent(parent, false);
+            GameObject obj = CreateUIObj("Progress", parent);
+            RectTransform r = obj.AddComponent<RectTransform>();
+            SetRect(obj, position, size);
 
-            RectTransform rect = obj.AddComponent<RectTransform>();
-            rect.anchorMin = new Vector2(0, 1);
-            rect.anchorMax = new Vector2(0, 1);
-            rect.pivot = new Vector2(0, 1);
-            rect.anchoredPosition = new Vector2(position.x, -position.y + parent.sizeDelta.y);
-            rect.sizeDelta = size;
-
-            // Background
-            GameObject bgObj = new GameObject("Background");
-            bgObj.transform.SetParent(obj.transform, false);
-            Image bgImage = bgObj.AddComponent<Image>();
-            bgImage.color = new Color(0.2f, 0.2f, 0.3f, 1f);
-            RectTransform bgRect = bgObj.GetComponent<RectTransform>();
-            bgRect.anchorMin = Vector2.zero;
-            bgRect.anchorMax = Vector2.one;
-            bgRect.offsetMin = Vector2.zero;
-            bgRect.offsetMax = Vector2.zero;
+            // BG
+            GameObject bgObj = CreateUIObj("BG", obj.transform);
+            bgObj.AddComponent<Image>().color = new Color(0.2f, 0.2f, 0.3f, 1f);
+            StretchFill(bgObj);
 
             // Fill area
-            GameObject fillArea = new GameObject("FillArea");
-            fillArea.transform.SetParent(obj.transform, false);
-            RectTransform fillAreaRect = fillArea.AddComponent<RectTransform>();
-            fillAreaRect.anchorMin = Vector2.zero;
-            fillAreaRect.anchorMax = Vector2.one;
-            fillAreaRect.offsetMin = Vector2.zero;
-            fillAreaRect.offsetMax = Vector2.zero;
+            GameObject fillArea = CreateUIObj("FillArea", obj.transform);
+            RectTransform far = fillArea.AddComponent<RectTransform>();
+            far.anchorMin = Vector2.zero;
+            far.anchorMax = Vector2.one;
+            far.offsetMin = Vector2.zero;
+            far.offsetMax = Vector2.zero;
 
             // Fill
-            GameObject fillObj = new GameObject("Fill");
-            fillObj.transform.SetParent(fillArea.transform, false);
-            Image fillImage = fillObj.AddComponent<Image>();
-            fillImage.color = accentColor;
+            GameObject fillObj = CreateUIObj("Fill", fillArea.transform);
+            fillObj.AddComponent<Image>().color = accentColor;
             RectTransform fillRect = fillObj.GetComponent<RectTransform>();
             fillRect.anchorMin = Vector2.zero;
             fillRect.anchorMax = Vector2.one;
             fillRect.offsetMin = Vector2.zero;
             fillRect.offsetMax = Vector2.zero;
 
-            // Slider component
             Slider slider = obj.AddComponent<Slider>();
             slider.fillRect = fillRect;
             slider.minValue = 0f;
             slider.maxValue = 1f;
             slider.value = 0f;
-            slider.interactable = false; // Read-only progress bar
+            slider.interactable = false;
 
             return slider;
         }
@@ -508,180 +452,92 @@ namespace Meta3DScanner
 
         private void SetupEventSystem()
         {
-            // Find or create EventSystem
-            eventSystem = FindObjectOfType<EventSystem>();
-            if (eventSystem == null)
+            EventSystem es = FindFirstObjectByType<EventSystem>();
+            if (es == null)
             {
                 GameObject esObj = new GameObject("EventSystem");
-                eventSystem = esObj.AddComponent<EventSystem>();
+                es = esObj.AddComponent<EventSystem>();
+                esObj.AddComponent<StandaloneInputModule>();
             }
-
-            // Remove StandaloneInputModule if present (not suitable for VR)
-            StandaloneInputModule standaloneInput = eventSystem.GetComponent<StandaloneInputModule>();
-            if (standaloneInput != null)
-            {
-                DestroyImmediate(standaloneInput);
-            }
-
-            // Try to add OVRInputModule for VR controller interaction
-            try
-            {
-                var ovrInputModule = eventSystem.gameObject.GetComponent<OVRInputModule>();
-                if (ovrInputModule == null)
-                {
-                    ovrInputModule = eventSystem.gameObject.AddComponent<OVRInputModule>();
-                }
-            }
-            catch
-            {
-                // If OVRInputModule is not available, add back StandaloneInputModule as fallback
-                if (eventSystem.GetComponent<BaseInputModule>() == null)
-                {
-                    eventSystem.gameObject.AddComponent<StandaloneInputModule>();
-                }
-                Debug.LogWarning("[Meta3D-UI] OVRInputModule not available, using fallback input module");
-            }
-
-            Debug.Log("[Meta3D-UI] Event system configured");
         }
 
         // =========================================================
-        // Button Event Handlers
+        // Button Handlers
         // =========================================================
 
-        private void OnConnectButtonClicked()
+        private void OnConnectClicked()
         {
             string ip = ipInputField != null ? ipInputField.text : "192.168.1.100";
             int port = 8765;
-
             if (portInputField != null)
             {
                 int.TryParse(portInputField.text, out port);
                 if (port <= 0 || port > 65535) port = 8765;
             }
-
             OnConnectRequested?.Invoke(ip, port);
         }
 
-        private void OnScanButtonClicked()
-        {
-            OnScanRequested?.Invoke();
-        }
-
-        private void OnStopButtonClicked()
-        {
-            OnStopRequested?.Invoke();
-        }
+        private void OnSelectObjectClicked() { OnSelectObjectRequested?.Invoke(); }
+        private void OnScanClicked() { OnScanRequested?.Invoke(); }
+        private void OnStopClicked() { OnStopRequested?.Invoke(); }
 
         // =========================================================
         // Public API
         // =========================================================
 
-        /// <summary>
-        /// Show or hide the hand UI.
-        /// </summary>
         public void SetVisible(bool visible)
         {
             isUIVisible = visible;
-            if (canvasObject != null)
-            {
-                canvasObject.SetActive(visible);
-            }
+            if (canvasObject != null) canvasObject.SetActive(visible);
         }
 
-        /// <summary>
-        /// Toggle UI visibility.
-        /// </summary>
-        public void ToggleVisible()
-        {
-            SetVisible(!isUIVisible);
-        }
+        public void ToggleVisible() { SetVisible(!isUIVisible); }
 
-        /// <summary>
-        /// Update the status display text.
-        /// </summary>
         public void SetStatus(string text, Color color)
         {
-            if (statusText != null)
-            {
-                statusText.text = text;
-                statusText.color = color;
-            }
+            if (statusText != null) { statusText.text = text; statusText.color = color; }
         }
 
-        /// <summary>
-        /// Update the instruction text.
-        /// </summary>
         public void SetInstruction(string text)
         {
-            if (instructionText != null)
-            {
-                instructionText.text = text;
-            }
+            if (instructionText != null) instructionText.text = text;
         }
 
-        /// <summary>
-        /// Update the frame count display.
-        /// </summary>
         public void SetFrameCount(int current, int target)
         {
             if (frameCountText != null)
-            {
-                frameCountText.text = $"Frame: {current} / {target}";
-            }
+                frameCountText.text = "Frame: " + current + " / " + target;
         }
 
-        /// <summary>
-        /// Update the quality display.
-        /// </summary>
         public void SetQuality(string text, Color color)
         {
-            if (qualityText != null)
-            {
-                qualityText.text = text;
-                qualityText.color = color;
-            }
+            if (qualityText != null) { qualityText.text = text; qualityText.color = color; }
         }
 
-        /// <summary>
-        /// Update the progress bar.
-        /// </summary>
         public void SetProgress(float value)
         {
-            if (progressBar != null)
-            {
-                progressBar.value = Mathf.Clamp01(value);
-            }
+            if (progressBar != null) progressBar.value = Mathf.Clamp01(value);
         }
 
-        /// <summary>
-        /// Update connection indicator color.
-        /// </summary>
         public void SetConnectionStatus(bool connected)
         {
             if (connectionIndicator != null)
-            {
                 connectionIndicator.color = connected ? successColor : errorColor;
-            }
-
             if (connectButtonText != null)
-            {
-                connectButtonText.text = connected ? "Bağlı ✓" : "Bağlan";
-            }
+                connectButtonText.text = connected ? "Bagli" : "Baglan";
         }
 
-        /// <summary>
-        /// Enable/disable scan and stop buttons
-        /// </summary>
+        public void SetSelectButtonEnabled(bool enabled)
+        {
+            if (selectObjectButton != null) selectObjectButton.interactable = enabled;
+        }
+
         public void SetScanButtonsState(bool scanEnabled, bool stopEnabled)
         {
             if (scanButton != null) scanButton.interactable = scanEnabled;
             if (stopButton != null) stopButton.interactable = stopEnabled;
         }
 
-        /// <summary>
-        /// Enable/disable connect button
-        /// </summary>
         public void SetConnectButtonEnabled(bool enabled)
         {
             if (connectButton != null) connectButton.interactable = enabled;
@@ -689,12 +545,16 @@ namespace Meta3DScanner
 
         private void OnDestroy()
         {
-            if (connectButton != null)
-                connectButton.onClick.RemoveListener(OnConnectButtonClicked);
-            if (scanButton != null)
-                scanButton.onClick.RemoveListener(OnScanButtonClicked);
-            if (stopButton != null)
-                stopButton.onClick.RemoveListener(OnStopButtonClicked);
+            if (connectButton != null) connectButton.onClick.RemoveListener(OnConnectClicked);
+            if (selectObjectButton != null) selectObjectButton.onClick.RemoveListener(OnSelectObjectClicked);
+            if (scanButton != null) scanButton.onClick.RemoveListener(OnScanClicked);
+            if (stopButton != null) stopButton.onClick.RemoveListener(OnStopClicked);
+
+            if (controllerManager != null)
+            {
+                controllerManager.OnLeftGripDown -= OnLeftGripDown;
+                controllerManager.OnLeftGripUp -= OnLeftGripUp;
+            }
         }
     }
 }

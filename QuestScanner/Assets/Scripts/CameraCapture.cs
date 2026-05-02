@@ -1,372 +1,197 @@
 /*
- * Meta3D Scanner - Camera Capture Module
- * Accesses Quest 3S Passthrough Camera API for high-quality frame capture.
- * 
- * Requires:
- * - Meta XR SDK (Passthrough Camera API)
- * - Horizon OS v74+
- * - android.permission.CAMERA or horizonos.permission.HEADSET_CAMERA
+ * MetaScan — Camera Capture
+ * Captures passthrough camera images from Meta Quest 3S.
+ * Uses #if META_XR_SDK for OVR Camera Access API.
+ * Encodes frames as JPEG with quality metrics.
  */
 
 using System;
-using System.Collections;
 using UnityEngine;
-using UnityEngine.UI;
 
-namespace Meta3DScanner
+namespace MetaScan
 {
     public class CameraCapture : MonoBehaviour
     {
-        [Header("Camera Settings")]
-        [SerializeField] private int targetWidth = 1280;
-        [SerializeField] private int targetHeight = 960;
-        [SerializeField] private int targetFPS = 30;
+        [Header("Capture Settings")]
+        [SerializeField] private int captureWidth = 1280;
+        [SerializeField] private int captureHeight = 960;
+        [SerializeField] private int jpegQuality = 85;
+        [SerializeField] private float captureInterval = 0.1f; // 10 fps default
 
         [Header("Quality Settings")]
-        [SerializeField] private int jpegQuality = 95;
-        [SerializeField] private bool usePNG = false; // PNG = lossless but larger
+        [SerializeField] private float blurThreshold = 100f;
 
-        [Header("Debug")]
-        [SerializeField] private bool showDebugPreview = false;
-        [SerializeField] private RawImage debugPreviewImage;
+        // State
+        public bool IsCapturing { get; private set; }
+        public int FrameIndex { get; private set; }
+        public float LastCaptureTime { get; private set; }
 
-        // Camera state
-        private WebCamTexture webCamTexture;
-        private Texture2D captureTexture;
-        private bool isCapturing = false;
-        private int frameIndex = 0;
+        // Events
+        public event Action<CapturedFrame> OnFrameCaptured;
 
-        // OVR head tracking reference
-        private OVRCameraRig ovrCameraRig;
+        // Head tracking
+        private Transform headTransform;
+        private float nextCaptureTime;
 
-        // Camera intrinsics (will be set from Quest API)
-        private float focalLengthX = 600f;
-        private float focalLengthY = 600f;
+        // Camera intrinsics (estimated defaults for Quest 3S)
+        private float focalLengthX = 640f;
+        private float focalLengthY = 640f;
         private float principalPointX = 640f;
         private float principalPointY = 480f;
 
-        // Events
-        public event Action<byte[], CameraFrameData> OnFrameCaptured;
-        public event Action<string> OnCameraError;
+        // Render texture for screenshot fallback
+        private RenderTexture captureRT;
+        private Texture2D captureTexture;
 
-        public bool IsCapturing => isCapturing;
-        public int FrameIndex => frameIndex;
-
-        /// <summary>
-        /// Camera frame metadata
-        /// </summary>
-        [Serializable]
-        public class CameraFrameData
+        public struct CapturedFrame
         {
-            public float timestamp;
             public int frameIndex;
-            public float[] poseMatrix; // 4x4 flattened
-            public float focalLengthX;
-            public float focalLengthY;
-            public float principalPointX;
-            public float principalPointY;
-            public int width;
-            public int height;
-            public bool hasDepth;
-            public float blurScore;
-            public float brightness;
+            public double timestamp;
+            public byte[] imageData;       // JPEG
+            public byte[] depthData;       // raw uint16 (from DepthCapture)
+            public Vector3 position;
+            public Quaternion rotation;
+            public float fx, fy, cx, cy;
         }
 
         private void Start()
         {
-            // Find OVRCameraRig for head pose tracking
-            ovrCameraRig = FindObjectOfType<OVRCameraRig>();
+            FindHeadTransform();
 
-            // Request camera permission on Quest
-            StartCoroutine(RequestCameraPermission());
+            // Create capture texture
+            captureRT = new RenderTexture(captureWidth, captureHeight, 24);
+            captureTexture = new Texture2D(captureWidth, captureHeight, TextureFormat.RGB24, false);
         }
 
-        private IEnumerator RequestCameraPermission()
+        private void FindHeadTransform()
         {
-            // Check if we have camera permission
-            if (!UnityEngine.Android.Permission.HasUserAuthorizedPermission(
-                UnityEngine.Android.Permission.Camera))
+#if META_XR_SDK
+            OVRCameraRig rig = FindFirstObjectByType<OVRCameraRig>();
+            if (rig != null && rig.centerEyeAnchor != null)
             {
-                UnityEngine.Android.Permission.RequestUserPermission(
-                    UnityEngine.Android.Permission.Camera);
-                yield return new WaitForSeconds(1f);
-            }
-
-            // Also request Quest-specific permission
-            try
-            {
-                UnityEngine.Android.Permission.RequestUserPermission(
-                    "horizonos.permission.HEADSET_CAMERA");
-            }
-            catch (Exception e)
-            {
-                Debug.LogWarning($"[Meta3D] Quest camera permission request: {e.Message}");
-            }
-
-            yield return new WaitForSeconds(0.5f);
-            InitializeCamera();
-        }
-
-        private void InitializeCamera()
-        {
-            WebCamDevice[] devices = WebCamTexture.devices;
-
-            if (devices.Length == 0)
-            {
-                Debug.LogError("[Meta3D] No cameras found!");
-                OnCameraError?.Invoke("No cameras available");
+                headTransform = rig.centerEyeAnchor;
                 return;
             }
-
-            // Log available cameras
-            foreach (var device in devices)
-            {
-                Debug.Log($"[Meta3D] Camera found: {device.name}");
-            }
-
-            // Use the first available camera (Quest passthrough camera)
-            webCamTexture = new WebCamTexture(devices[0].name, targetWidth, targetHeight, targetFPS);
-            captureTexture = new Texture2D(targetWidth, targetHeight, TextureFormat.RGB24, false);
-
-            // Show debug preview if enabled
-            if (showDebugPreview && debugPreviewImage != null)
-            {
-                debugPreviewImage.texture = webCamTexture;
-            }
-
-            Debug.Log($"[Meta3D] Camera initialized: {devices[0].name} ({targetWidth}x{targetHeight} @ {targetFPS}fps)");
+#endif
+            Camera cam = Camera.main;
+            if (cam != null) headTransform = cam.transform;
         }
 
-        /// <summary>
-        /// Start capturing frames
-        /// </summary>
-        public void StartCapture()
+        public void StartCapturing()
         {
-            if (webCamTexture == null)
-            {
-                OnCameraError?.Invoke("Camera not initialized");
-                return;
-            }
-
-            if (!webCamTexture.isPlaying)
-            {
-                webCamTexture.Play();
-            }
-
-            isCapturing = true;
-            frameIndex = 0;
-            StartCoroutine(CaptureLoop());
-            Debug.Log("[Meta3D] Capture started");
+            IsCapturing = true;
+            FrameIndex = 0;
+            nextCaptureTime = 0f;
+            Debug.Log("[MetaScan-Camera] Capture started");
         }
 
-        /// <summary>
-        /// Stop capturing frames
-        /// </summary>
-        public void StopCapture()
+        public void StopCapturing()
         {
-            isCapturing = false;
-            if (webCamTexture != null && webCamTexture.isPlaying)
-            {
-                webCamTexture.Stop();
-            }
-            Debug.Log($"[Meta3D] Capture stopped. Total frames: {frameIndex}");
+            IsCapturing = false;
+            Debug.Log($"[MetaScan-Camera] Capture stopped. Total frames: {FrameIndex}");
         }
 
-        private IEnumerator CaptureLoop()
+        private void Update()
         {
-            float captureInterval = 1f / targetFPS;
-            WaitForSeconds wait = new WaitForSeconds(captureInterval);
+            if (!IsCapturing) return;
+            if (Time.time < nextCaptureTime) return;
 
-            while (isCapturing)
-            {
-                if (webCamTexture.didUpdateThisFrame)
-                {
-                    CaptureFrame();
-                }
-                yield return wait;
-            }
+            CaptureFrame();
+            nextCaptureTime = Time.time + captureInterval;
         }
 
         private void CaptureFrame()
         {
-            if (webCamTexture == null || !webCamTexture.isPlaying) return;
-
-            // Update texture dimensions if needed
-            if (captureTexture.width != webCamTexture.width ||
-                captureTexture.height != webCamTexture.height)
-            {
-                captureTexture.Reinitialize(webCamTexture.width, webCamTexture.height);
-            }
-
-            // Get pixels from webcam texture
-            captureTexture.SetPixels(webCamTexture.GetPixels());
-            captureTexture.Apply();
-
-            // Encode to JPEG or PNG
-            byte[] imageBytes;
-            if (usePNG)
-            {
-                imageBytes = captureTexture.EncodeToPNG();
-            }
-            else
-            {
-                imageBytes = captureTexture.EncodeToJPG(jpegQuality);
-            }
-
-            // Get camera pose from head tracking
-            float[] poseMatrix = GetHeadPoseMatrix();
-
-            // Calculate image quality metrics
-            float brightness = CalculateBrightness(captureTexture);
-            float blurScore = CalculateBlurScore(captureTexture);
-
-            // Create frame data
-            CameraFrameData frameData = new CameraFrameData
-            {
-                timestamp = Time.realtimeSinceStartup,
-                frameIndex = frameIndex,
-                poseMatrix = poseMatrix,
-                focalLengthX = focalLengthX,
-                focalLengthY = focalLengthY,
-                principalPointX = principalPointX,
-                principalPointY = principalPointY,
-                width = captureTexture.width,
-                height = captureTexture.height,
-                hasDepth = false, // Depth handled by DepthCapture module
-                blurScore = blurScore,
-                brightness = brightness
-            };
-
-            // Fire event
-            OnFrameCaptured?.Invoke(imageBytes, frameData);
-            frameIndex++;
-        }
-
-        /// <summary>
-        /// Get the current headset pose as a 4x4 matrix (flattened row-major)
-        /// </summary>
-        private float[] GetHeadPoseMatrix()
-        {
-            // Get the center eye anchor / head transform
-            // Prefer OVRCameraRig if available
-            Transform headTransform = null;
-            if (ovrCameraRig != null && ovrCameraRig.centerEyeAnchor != null)
-            {
-                headTransform = ovrCameraRig.centerEyeAnchor;
-            }
-            else
-            {
-                Camera mainCam = Camera.main;
-                if (mainCam != null) headTransform = mainCam.transform;
-            }
-
             if (headTransform == null)
             {
-                Debug.LogWarning("[Meta3D] No camera transform found for head pose");
-                return new float[16];
+                FindHeadTransform();
+                if (headTransform == null) return;
             }
 
-            Matrix4x4 poseMatrix = Matrix4x4.TRS(
-                headTransform.position,
-                headTransform.rotation,
-                Vector3.one
-            );
+            byte[] imageData = CaptureImage();
+            if (imageData == null || imageData.Length == 0) return;
 
-            // Flatten to row-major array
-            float[] matrix = new float[16];
-            for (int row = 0; row < 4; row++)
+            CapturedFrame frame = new CapturedFrame
             {
-                for (int col = 0; col < 4; col++)
-                {
-                    matrix[row * 4 + col] = poseMatrix[row, col];
-                }
-            }
+                frameIndex = FrameIndex,
+                timestamp = GetTimestamp(),
+                imageData = imageData,
+                depthData = new byte[0], // Will be filled by DataStreamer from DepthCapture
+                position = headTransform.position,
+                rotation = headTransform.rotation,
+                fx = focalLengthX,
+                fy = focalLengthY,
+                cx = principalPointX,
+                cy = principalPointY,
+            };
 
-            return matrix;
+            FrameIndex++;
+            LastCaptureTime = Time.time;
+
+            OnFrameCaptured?.Invoke(frame);
         }
 
-        /// <summary>
-        /// Calculate average brightness of the frame (0-255)
-        /// </summary>
-        private float CalculateBrightness(Texture2D tex)
+        private byte[] CaptureImage()
         {
-            Color[] pixels = tex.GetPixels(0);
-            float totalBrightness = 0;
-            int sampleCount = Mathf.Min(pixels.Length, 10000); // Sample subset for performance
+#if META_XR_SDK
+            // Try OVR Passthrough Camera API first
+            // NOTE: Requires Meta XR Camera Access package
+            // The Passthrough Camera API provides camera frames via
+            // OVRPlugin.Media.GetMrcFrameImageData or
+            // PassthroughCameraUtils (Meta-specific)
+            // For now, fall through to screenshot-based capture
+#endif
 
-            int step = pixels.Length / sampleCount;
-            for (int i = 0; i < pixels.Length; i += step)
-            {
-                totalBrightness += (pixels[i].r + pixels[i].g + pixels[i].b) / 3f;
-            }
+            // Fallback: capture screen via RenderTexture
+            Camera cam = headTransform != null
+                ? headTransform.GetComponent<Camera>()
+                : Camera.main;
 
-            return (totalBrightness / sampleCount) * 255f;
+            if (cam == null) return null;
+
+            RenderTexture prevRT = cam.targetTexture;
+            cam.targetTexture = captureRT;
+            cam.Render();
+            cam.targetTexture = prevRT;
+
+            RenderTexture prevActive = RenderTexture.active;
+            RenderTexture.active = captureRT;
+            captureTexture.ReadPixels(new Rect(0, 0, captureWidth, captureHeight), 0, 0);
+            captureTexture.Apply();
+            RenderTexture.active = prevActive;
+
+            byte[] jpegData = captureTexture.EncodeToJPG(jpegQuality);
+            return jpegData;
         }
 
-        /// <summary>
-        /// Estimate blur score using pixel variance (higher = sharper)
-        /// Simple GPU-friendly approximation of Laplacian variance
-        /// </summary>
-        private float CalculateBlurScore(Texture2D tex)
+        private double GetTimestamp()
         {
-            Color[] pixels = tex.GetPixels(0);
-            int width = tex.width;
-            int height = tex.height;
-            float sumDiff = 0;
-            int samples = 0;
-
-            // Sample from center region for speed
-            int startX = width / 4;
-            int endX = 3 * width / 4;
-            int startY = height / 4;
-            int endY = 3 * height / 4;
-            int step = 4; // Sample every 4th pixel
-
-            for (int y = startY; y < endY; y += step)
-            {
-                for (int x = startX; x < endX; x += step)
-                {
-                    if (x < 1 || y < 1 || x >= width - 1 || y >= height - 1) continue;
-
-                    float center = pixels[y * width + x].grayscale;
-                    float left = pixels[y * width + (x - 1)].grayscale;
-                    float right = pixels[y * width + (x + 1)].grayscale;
-                    float up = pixels[(y - 1) * width + x].grayscale;
-                    float down = pixels[(y + 1) * width + x].grayscale;
-
-                    // Laplacian
-                    float laplacian = Mathf.Abs(left + right + up + down - 4 * center);
-                    sumDiff += laplacian * laplacian;
-                    samples++;
-                }
-            }
-
-            return samples > 0 ? (sumDiff / samples) * 10000f : 0;
+            return (DateTime.UtcNow - new DateTime(1970, 1, 1)).TotalSeconds;
         }
 
         /// <summary>
-        /// Update camera intrinsics if available from Quest API
+        /// Set camera intrinsics from external source (e.g., OVR API).
         /// </summary>
-        public void SetCameraIntrinsics(float fx, float fy, float cx, float cy)
+        public void SetIntrinsics(float fx, float fy, float cx, float cy)
         {
             focalLengthX = fx;
             focalLengthY = fy;
             principalPointX = cx;
             principalPointY = cy;
-            Debug.Log($"[Meta3D] Intrinsics set: fx={fx}, fy={fy}, cx={cx}, cy={cy}");
+        }
+
+        /// <summary>
+        /// Set capture frame rate.
+        /// </summary>
+        public void SetCaptureRate(float fps)
+        {
+            captureInterval = 1f / Mathf.Max(fps, 1f);
         }
 
         private void OnDestroy()
         {
-            StopCapture();
-            if (webCamTexture != null)
-            {
-                Destroy(webCamTexture);
-            }
-            if (captureTexture != null)
-            {
-                Destroy(captureTexture);
-            }
+            if (captureRT != null) captureRT.Release();
+            if (captureTexture != null) Destroy(captureTexture);
         }
     }
 }

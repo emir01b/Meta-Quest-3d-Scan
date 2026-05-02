@@ -1,240 +1,243 @@
 /*
- * Meta3D Scanner - Controller Manager
- * Manages left and right Quest controller input and state.
- * Provides events for button presses and tracking data.
- * 
- * Left controller = UI interaction
- * Right controller = Scanning
+ * MetaScan — Controller Manager
+ * Manages left/right controller input, button events, and haptic feedback.
+ * Uses #if META_XR_SDK for OVR dependencies.
  */
 
 using System;
 using UnityEngine;
 
-namespace Meta3DScanner
+namespace MetaScan
 {
     public class ControllerManager : MonoBehaviour
     {
-        [Header("References (Auto-found if empty)")]
-        [SerializeField] private OVRCameraRig cameraRig;
-
-        // Controller anchors from OVRCameraRig
-        private Transform leftHandAnchor;
-        private Transform rightHandAnchor;
-        private Transform leftControllerAnchor;
-        private Transform rightControllerAnchor;
-
-        // Controller state
-        private bool leftControllerConnected;
-        private bool rightControllerConnected;
-
-        // Events - Right Controller (Scanning)
-        public event Action OnRightTriggerDown;
-        public event Action OnRightTriggerUp;
-        public event Action OnRightGripDown;
-        public event Action OnRightGripUp;
-        public event Action OnRightPrimaryButtonDown;   // A button
-        public event Action OnRightSecondaryButtonDown;  // B button
-
-        // Events - Left Controller (UI)
-        public event Action OnLeftTriggerDown;
-        public event Action OnLeftTriggerUp;
-        public event Action OnLeftPrimaryButtonDown;    // X button
-        public event Action OnLeftSecondaryButtonDown;   // Y button
+        // Hand anchor references (set by SceneBootstrapper or found at runtime)
+        [Header("References")]
+        [SerializeField] private Transform leftHandAnchor;
+        [SerializeField] private Transform rightHandAnchor;
 
         // Public accessors
         public Transform LeftHandAnchor => leftHandAnchor;
         public Transform RightHandAnchor => rightHandAnchor;
-        public Transform LeftControllerAnchor => leftControllerAnchor;
-        public Transform RightControllerAnchor => rightControllerAnchor;
-        public bool IsLeftConnected => leftControllerConnected;
-        public bool IsRightConnected => rightControllerConnected;
+
+        // Controller state
+        public Vector3 LeftPosition { get; private set; }
+        public Quaternion LeftRotation { get; private set; }
+        public Vector3 RightPosition { get; private set; }
+        public Quaternion RightRotation { get; private set; }
+
+        // Button events
+        public event Action OnLeftGripDown;
+        public event Action OnLeftGripUp;
+        public event Action OnLeftTriggerDown;
+        public event Action OnLeftTriggerUp;
+        public event Action OnLeftPrimaryButtonDown;
+        public event Action OnLeftSecondaryButtonDown;
+
+        public event Action OnRightGripDown;
+        public event Action OnRightGripUp;
+        public event Action OnRightTriggerDown;
+        public event Action OnRightTriggerUp;
+        public event Action OnRightPrimaryButtonDown;
+        public event Action OnRightSecondaryButtonDown;
+
+        // Grip hold state
+        public bool IsLeftGripHeld { get; private set; }
+        public bool IsRightGripHeld { get; private set; }
+        public bool IsRightTriggerHeld { get; private set; }
+        public bool IsLeftTriggerHeld { get; private set; }
 
         private void Start()
         {
-            FindCameraRig();
+            FindAnchors();
         }
 
-        private void FindCameraRig()
+        private void FindAnchors()
         {
-            if (cameraRig == null)
+#if META_XR_SDK
+            if (leftHandAnchor == null || rightHandAnchor == null)
             {
-                cameraRig = FindObjectOfType<OVRCameraRig>();
+                OVRCameraRig cameraRig = FindFirstObjectByType<OVRCameraRig>();
+                if (cameraRig != null)
+                {
+                    if (leftHandAnchor == null)
+                        leftHandAnchor = cameraRig.leftHandAnchor;
+                    if (rightHandAnchor == null)
+                        rightHandAnchor = cameraRig.rightHandAnchor;
+                }
+            }
+#endif
+
+            if (leftHandAnchor == null || rightHandAnchor == null)
+            {
+                // Editor fallback — create dummy anchors
+                Camera cam = Camera.main;
+                if (cam != null)
+                {
+                    if (leftHandAnchor == null)
+                    {
+                        GameObject leftObj = new GameObject("FallbackLeftHand");
+                        leftObj.transform.SetParent(cam.transform, false);
+                        leftObj.transform.localPosition = new Vector3(-0.3f, -0.3f, 0.5f);
+                        leftHandAnchor = leftObj.transform;
+                    }
+                    if (rightHandAnchor == null)
+                    {
+                        GameObject rightObj = new GameObject("FallbackRightHand");
+                        rightObj.transform.SetParent(cam.transform, false);
+                        rightObj.transform.localPosition = new Vector3(0.3f, -0.3f, 0.5f);
+                        rightHandAnchor = rightObj.transform;
+                    }
+                }
             }
 
-            if (cameraRig == null)
-            {
-                Debug.LogError("[Meta3D-Controller] OVRCameraRig not found!");
-                return;
-            }
-
-            // Get anchors from OVRCameraRig hierarchy
-            leftHandAnchor = cameraRig.leftHandAnchor;
-            rightHandAnchor = cameraRig.rightHandAnchor;
-            leftControllerAnchor = cameraRig.leftControllerAnchor;
-            rightControllerAnchor = cameraRig.rightControllerAnchor;
-
-            Debug.Log("[Meta3D-Controller] Controller anchors initialized");
+            Debug.Log("[MetaScan-Controller] Anchors initialized: " +
+                $"Left={leftHandAnchor != null}, Right={rightHandAnchor != null}");
         }
 
         private void Update()
         {
-            // Check controller connection
-            leftControllerConnected = OVRInput.IsControllerConnected(OVRInput.Controller.LTouch);
-            rightControllerConnected = OVRInput.IsControllerConnected(OVRInput.Controller.RTouch);
-
-            // Process right controller input (scanning)
-            ProcessRightController();
-
-            // Process left controller input (UI)
-            ProcessLeftController();
+            UpdateTransforms();
+            UpdateInput();
         }
 
-        private void ProcessRightController()
+        private void UpdateTransforms()
         {
-            if (!rightControllerConnected) return;
-
-            // Right Index Trigger
-            if (OVRInput.GetDown(OVRInput.Button.SecondaryIndexTrigger))
+            if (leftHandAnchor != null)
             {
-                OnRightTriggerDown?.Invoke();
-            }
-            if (OVRInput.GetUp(OVRInput.Button.SecondaryIndexTrigger))
-            {
-                OnRightTriggerUp?.Invoke();
-            }
-
-            // Right Hand Trigger (Grip)
-            if (OVRInput.GetDown(OVRInput.Button.SecondaryHandTrigger))
-            {
-                OnRightGripDown?.Invoke();
-            }
-            if (OVRInput.GetUp(OVRInput.Button.SecondaryHandTrigger))
-            {
-                OnRightGripUp?.Invoke();
-            }
-
-            // A Button
-            if (OVRInput.GetDown(OVRInput.Button.One))
-            {
-                OnRightPrimaryButtonDown?.Invoke();
-            }
-
-            // B Button
-            if (OVRInput.GetDown(OVRInput.Button.Two))
-            {
-                OnRightSecondaryButtonDown?.Invoke();
-            }
-        }
-
-        private void ProcessLeftController()
-        {
-            if (!leftControllerConnected) return;
-
-            // Left Index Trigger
-            if (OVRInput.GetDown(OVRInput.Button.PrimaryIndexTrigger))
-            {
-                OnLeftTriggerDown?.Invoke();
-            }
-            if (OVRInput.GetUp(OVRInput.Button.PrimaryIndexTrigger))
-            {
-                OnLeftTriggerUp?.Invoke();
-            }
-
-            // X Button
-            if (OVRInput.GetDown(OVRInput.Button.Three))
-            {
-                OnLeftPrimaryButtonDown?.Invoke();
-            }
-
-            // Y Button
-            if (OVRInput.GetDown(OVRInput.Button.Four))
-            {
-                OnLeftSecondaryButtonDown?.Invoke();
-            }
-        }
-
-        /// <summary>
-        /// Get the world-space ray from the right controller (for scanning).
-        /// </summary>
-        public Ray GetRightControllerRay()
-        {
-            if (rightControllerAnchor != null)
-            {
-                return new Ray(rightControllerAnchor.position, rightControllerAnchor.forward);
+                LeftPosition = leftHandAnchor.position;
+                LeftRotation = leftHandAnchor.rotation;
             }
             if (rightHandAnchor != null)
             {
-                return new Ray(rightHandAnchor.position, rightHandAnchor.forward);
+                RightPosition = rightHandAnchor.position;
+                RightRotation = rightHandAnchor.rotation;
             }
-            return new Ray(Vector3.zero, Vector3.forward);
         }
 
-        /// <summary>
-        /// Get the world-space ray from the left controller (for UI interaction).
-        /// </summary>
-        public Ray GetLeftControllerRay()
+        private void UpdateInput()
         {
-            if (leftControllerAnchor != null)
+#if META_XR_SDK
+            // === Left Controller ===
+
+            // Grip (hold detection)
+            if (OVRInput.GetDown(OVRInput.Button.PrimaryHandTrigger, OVRInput.Controller.LTouch))
             {
-                return new Ray(leftControllerAnchor.position, leftControllerAnchor.forward);
+                IsLeftGripHeld = true;
+                OnLeftGripDown?.Invoke();
             }
-            if (leftHandAnchor != null)
+            if (OVRInput.GetUp(OVRInput.Button.PrimaryHandTrigger, OVRInput.Controller.LTouch))
             {
-                return new Ray(leftHandAnchor.position, leftHandAnchor.forward);
+                IsLeftGripHeld = false;
+                OnLeftGripUp?.Invoke();
             }
-            return new Ray(Vector3.zero, Vector3.forward);
-        }
 
-        /// <summary>
-        /// Get the right controller velocity (useful for motion blur detection).
-        /// </summary>
-        public Vector3 GetRightControllerVelocity()
-        {
-            return OVRInput.GetLocalControllerVelocity(OVRInput.Controller.RTouch);
-        }
-
-        /// <summary>
-        /// Get the right controller angular velocity.
-        /// </summary>
-        public Vector3 GetRightControllerAngularVelocity()
-        {
-            return OVRInput.GetLocalControllerAngularVelocity(OVRInput.Controller.RTouch);
-        }
-
-        /// <summary>
-        /// Trigger haptic feedback on a controller.
-        /// </summary>
-        public void TriggerHaptic(OVRInput.Controller controller, float frequency, float amplitude, float duration)
-        {
-            OVRInput.SetControllerVibration(frequency, amplitude, controller);
-
-            // Auto-stop haptic after duration
-            if (duration > 0f)
+            // Trigger
+            if (OVRInput.GetDown(OVRInput.Button.PrimaryIndexTrigger, OVRInput.Controller.LTouch))
             {
-                StartCoroutine(StopHapticAfter(controller, duration));
+                IsLeftTriggerHeld = true;
+                OnLeftTriggerDown?.Invoke();
             }
+            if (OVRInput.GetUp(OVRInput.Button.PrimaryIndexTrigger, OVRInput.Controller.LTouch))
+            {
+                IsLeftTriggerHeld = false;
+                OnLeftTriggerUp?.Invoke();
+            }
+
+            // Buttons
+            if (OVRInput.GetDown(OVRInput.Button.One, OVRInput.Controller.LTouch))
+                OnLeftPrimaryButtonDown?.Invoke();
+            if (OVRInput.GetDown(OVRInput.Button.Two, OVRInput.Controller.LTouch))
+                OnLeftSecondaryButtonDown?.Invoke();
+
+            // === Right Controller ===
+
+            // Grip
+            if (OVRInput.GetDown(OVRInput.Button.PrimaryHandTrigger, OVRInput.Controller.RTouch))
+            {
+                IsRightGripHeld = true;
+                OnRightGripDown?.Invoke();
+            }
+            if (OVRInput.GetUp(OVRInput.Button.PrimaryHandTrigger, OVRInput.Controller.RTouch))
+            {
+                IsRightGripHeld = false;
+                OnRightGripUp?.Invoke();
+            }
+
+            // Trigger
+            if (OVRInput.GetDown(OVRInput.Button.PrimaryIndexTrigger, OVRInput.Controller.RTouch))
+            {
+                IsRightTriggerHeld = true;
+                OnRightTriggerDown?.Invoke();
+            }
+            if (OVRInput.GetUp(OVRInput.Button.PrimaryIndexTrigger, OVRInput.Controller.RTouch))
+            {
+                IsRightTriggerHeld = false;
+                OnRightTriggerUp?.Invoke();
+            }
+
+            // Buttons
+            if (OVRInput.GetDown(OVRInput.Button.One, OVRInput.Controller.RTouch))
+                OnRightPrimaryButtonDown?.Invoke();
+            if (OVRInput.GetDown(OVRInput.Button.Two, OVRInput.Controller.RTouch))
+                OnRightSecondaryButtonDown?.Invoke();
+#else
+            // Editor fallback: keyboard input
+            if (Input.GetKeyDown(KeyCode.G))
+            {
+                IsLeftGripHeld = !IsLeftGripHeld;
+                if (IsLeftGripHeld) OnLeftGripDown?.Invoke();
+                else OnLeftGripUp?.Invoke();
+            }
+            if (Input.GetMouseButtonDown(0))
+            {
+                IsRightTriggerHeld = true;
+                OnRightTriggerDown?.Invoke();
+            }
+            if (Input.GetMouseButtonUp(0))
+            {
+                IsRightTriggerHeld = false;
+                OnRightTriggerUp?.Invoke();
+            }
+#endif
         }
 
-        private System.Collections.IEnumerator StopHapticAfter(OVRInput.Controller controller, float delay)
+        /// <summary>
+        /// Send haptic feedback to a controller.
+        /// </summary>
+        public void SendHaptic(bool isLeft, float frequency = 0.5f, float amplitude = 0.5f, float duration = 0.1f)
+        {
+#if META_XR_SDK
+            OVRInput.Controller ctrl = isLeft
+                ? OVRInput.Controller.LTouch
+                : OVRInput.Controller.RTouch;
+            OVRInput.SetControllerVibration(frequency, amplitude, ctrl);
+
+            // Stop vibration after duration
+            if (duration > 0)
+            {
+                StartCoroutine(StopHapticAfter(ctrl, duration));
+            }
+#endif
+        }
+
+#if META_XR_SDK
+        private System.Collections.IEnumerator StopHapticAfter(OVRInput.Controller ctrl, float delay)
         {
             yield return new WaitForSeconds(delay);
-            OVRInput.SetControllerVibration(0f, 0f, controller);
+            OVRInput.SetControllerVibration(0, 0, ctrl);
         }
+#endif
 
         /// <summary>
-        /// Quick haptic pulse on right controller (scan feedback).
+        /// Get the forward ray from a controller.
         /// </summary>
-        public void PulseScanHaptic()
+        public Ray GetControllerRay(bool isLeft)
         {
-            TriggerHaptic(OVRInput.Controller.RTouch, 0.5f, 0.3f, 0.05f);
-        }
-
-        /// <summary>
-        /// Quick haptic pulse on left controller (UI feedback).
-        /// </summary>
-        public void PulseUIHaptic()
-        {
-            TriggerHaptic(OVRInput.Controller.LTouch, 0.3f, 0.2f, 0.03f);
+            Transform anchor = isLeft ? leftHandAnchor : rightHandAnchor;
+            if (anchor != null)
+                return new Ray(anchor.position, anchor.forward);
+            return new Ray(Vector3.zero, Vector3.forward);
         }
     }
 }

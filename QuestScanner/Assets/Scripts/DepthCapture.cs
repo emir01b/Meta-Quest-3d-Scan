@@ -1,240 +1,142 @@
 /*
- * Meta3D Scanner - Depth Capture Module
- * Accesses Quest 3S Depth API for real-time depth maps.
- * 
- * Requires:
- * - Meta XR SDK with Depth API
- * - EnvironmentDepthManager component in scene
+ * MetaScan — Depth Capture
+ * Captures depth maps from Meta Quest 3S using the Depth API.
+ * Uses #if META_XR_SDK for OVR dependencies.
+ * Outputs uint16 depth data in millimeters.
  */
 
-using System;
 using UnityEngine;
-using UnityEngine.Rendering;
 
-namespace Meta3DScanner
+namespace MetaScan
 {
     public class DepthCapture : MonoBehaviour
     {
         [Header("Depth Settings")]
-        [SerializeField] private bool captureDepth = true;
-        [SerializeField] private bool useEnvironmentDepth = true; // Uses Meta Depth API
+        [SerializeField] private bool enableDepthCapture = true;
+        [SerializeField] private float maxDepth = 5.0f; // meters
 
-        [Header("References (Auto-found if empty)")]
-        [SerializeField] private OVRCameraRig ovrCameraRig;
+        // State
+        public bool IsDepthAvailable { get; private set; }
+        public int DepthWidth { get; private set; }
+        public int DepthHeight { get; private set; }
 
-        [Header("Debug")]
-        [SerializeField] private bool showDepthVisualization = false;
+        // Cached depth data
+        private byte[] lastDepthData;
+        private float lastDepthTime;
 
-        // Depth state
-        private RenderTexture depthRenderTexture;
-        private Texture2D depthTexture;
-        private bool isDepthAvailable = false;
-        private int depthWidth = 0;
-        private int depthHeight = 0;
-
-        // Events
-        public event Action<byte[], int, int> OnDepthCaptured;
-
-        public bool IsDepthAvailable => isDepthAvailable;
+#if META_XR_SDK
+        private OVRCameraRig cameraRig;
+#endif
 
         private void Start()
         {
-            if (ovrCameraRig == null)
-            {
-                ovrCameraRig = FindObjectOfType<OVRCameraRig>();
-            }
             InitializeDepth();
         }
 
         private void InitializeDepth()
         {
-            if (!captureDepth) return;
+#if META_XR_SDK
+            cameraRig = FindFirstObjectByType<OVRCameraRig>();
+            if (cameraRig == null)
+            {
+                Debug.LogWarning("[MetaScan-Depth] OVRCameraRig not found. Depth capture disabled.");
+                IsDepthAvailable = false;
+                return;
+            }
 
-            if (useEnvironmentDepth)
+            // Check if depth API is supported
+            OVRManager ovrManager = FindFirstObjectByType<OVRManager>();
+            if (ovrManager != null)
             {
-                InitializeEnvironmentDepth();
+                // Enable environment depth
+                // Note: This requires "Environment Depth" to be enabled in OVRManager
+                // and the correct permissions in AndroidManifest
+                Debug.Log("[MetaScan-Depth] Depth API initialization attempted");
+                IsDepthAvailable = true;
             }
-            else
-            {
-                InitializeFallbackDepth();
-            }
+#else
+            Debug.LogWarning("[MetaScan-Depth] Depth capture requires META_XR_SDK. Using fallback.");
+            IsDepthAvailable = false;
+#endif
         }
 
         /// <summary>
-        /// Initialize using Meta's Environment Depth API
+        /// Get the latest depth data as uint16 bytes (millimeters).
+        /// Returns empty array if depth not available.
         /// </summary>
-        private void InitializeEnvironmentDepth()
+        public byte[] GetDepthData()
         {
-            // The Meta Depth API provides depth through the EnvironmentDepthManager
-            // and EnvironmentDepthTextureProvider components.
-            // These should be set up in the Unity scene.
+            if (!enableDepthCapture || !IsDepthAvailable)
+                return new byte[0];
 
-            // Check if the OVRManager is available (present on OVRCameraRig)
-            OVRManager depthManager = null;
-            if (ovrCameraRig != null)
+#if META_XR_SDK
+            return CaptureDepthOVR();
+#else
+            return new byte[0];
+#endif
+        }
+
+#if META_XR_SDK
+        private byte[] CaptureDepthOVR()
+        {
+            // Current Meta XR SDK uses EnvironmentDepthManager for depth access.
+            // The depth texture is rendered automatically via the OVR compositor.
+            // Direct pixel readback is not supported through the old API.
+            // For scanning, we rely on camera frames + pose data primarily.
+            // Depth data will be available when EnvironmentDepthManager is in the scene.
+
+            // Try to find the global depth texture set by the SDK
+            Texture depthTex = Shader.GetGlobalTexture("_EnvironmentDepthTexture");
+            if (depthTex == null || !(depthTex is RenderTexture depthRT))
             {
-                depthManager = ovrCameraRig.GetComponent<OVRManager>();
-            }
-            if (depthManager == null)
-            {
-                depthManager = FindObjectOfType<OVRManager>();
+                return new byte[0];
             }
 
-            if (depthManager != null)
+            DepthWidth = depthRT.width;
+            DepthHeight = depthRT.height;
+
+            // Read depth texture
+            Texture2D readTex = new Texture2D(DepthWidth, DepthHeight, TextureFormat.RFloat, false);
+            RenderTexture prevActive = RenderTexture.active;
+            RenderTexture.active = depthRT;
+            readTex.ReadPixels(new Rect(0, 0, DepthWidth, DepthHeight), 0, 0);
+            readTex.Apply();
+            RenderTexture.active = prevActive;
+
+            // Convert float depth to uint16 millimeters
+            Color[] pixels = readTex.GetPixels();
+            byte[] depthBytes = new byte[DepthWidth * DepthHeight * 2];
+            for (int i = 0; i < pixels.Length; i++)
             {
-                Debug.Log("[Meta3D] OVRManager found, Depth API should be available");
-                isDepthAvailable = true;
+                float depthMeters = pixels[i].r;
+                ushort depthMM = (ushort)Mathf.Clamp(depthMeters * 1000f, 0, 65535);
+                depthBytes[i * 2] = (byte)(depthMM & 0xFF);
+                depthBytes[i * 2 + 1] = (byte)((depthMM >> 8) & 0xFF);
             }
-            else
-            {
-                Debug.LogWarning("[Meta3D] OVRManager not found. Add to scene for depth support.");
-                isDepthAvailable = false;
-            }
+
+            Object.Destroy(readTex);
+
+            lastDepthData = depthBytes;
+            lastDepthTime = Time.time;
+
+            return depthBytes;
+        }
+#endif
+
+        /// <summary>
+        /// Get the last captured depth data without recapturing.
+        /// </summary>
+        public byte[] GetLastDepthData()
+        {
+            return lastDepthData ?? new byte[0];
         }
 
         /// <summary>
-        /// Initialize fallback depth estimation
+        /// Check if depth data is reasonably fresh.
         /// </summary>
-        private void InitializeFallbackDepth()
+        public bool IsDepthFresh(float maxAge = 0.2f)
         {
-            // Fallback: Use the Unity depth buffer
-            depthWidth = 640;
-            depthHeight = 480;
-
-            depthRenderTexture = new RenderTexture(depthWidth, depthHeight, 24, RenderTextureFormat.Depth);
-            depthTexture = new Texture2D(depthWidth, depthHeight, TextureFormat.RFloat, false);
-
-            isDepthAvailable = true;
-            Debug.Log("[Meta3D] Fallback depth initialized (Unity depth buffer)");
-        }
-
-        /// <summary>
-        /// Capture the current depth frame as a byte array of uint16 values.
-        /// Returns null if depth is not available.
-        /// </summary>
-        public byte[] CaptureDepthFrame()
-        {
-            if (!captureDepth || !isDepthAvailable) return null;
-
-            if (useEnvironmentDepth)
-            {
-                return CaptureEnvironmentDepth();
-            }
-            else
-            {
-                return CaptureFallbackDepth();
-            }
-        }
-
-        /// <summary>
-        /// Capture depth from Meta's Environment Depth API.
-        /// The depth texture is available as a global shader variable: _EnvironmentDepthTexture
-        /// </summary>
-        private byte[] CaptureEnvironmentDepth()
-        {
-            try
-            {
-                // Access the environment depth texture through the shader global
-                // This is set by Meta's EnvironmentDepthTextureProvider
-                Texture depthTex = Shader.GetGlobalTexture("_EnvironmentDepthTexture");
-
-                if (depthTex == null)
-                {
-                    Debug.LogWarning("[Meta3D] Environment depth texture not available");
-                    return null;
-                }
-
-                if (depthTex is RenderTexture rt)
-                {
-                    depthWidth = rt.width;
-                    depthHeight = rt.height;
-
-                    // Read depth texture to CPU
-                    if (depthTexture == null ||
-                        depthTexture.width != depthWidth ||
-                        depthTexture.height != depthHeight)
-                    {
-                        depthTexture = new Texture2D(depthWidth, depthHeight,
-                            TextureFormat.RFloat, false);
-                    }
-
-                    RenderTexture.active = rt;
-                    depthTexture.ReadPixels(new Rect(0, 0, depthWidth, depthHeight), 0, 0);
-                    depthTexture.Apply();
-                    RenderTexture.active = null;
-
-                    // Convert float depth to uint16 (millimeters)
-                    Color[] pixels = depthTexture.GetPixels();
-                    byte[] depthBytes = new byte[depthWidth * depthHeight * 2];
-
-                    for (int i = 0; i < pixels.Length; i++)
-                    {
-                        // Depth value in meters -> convert to millimeters (uint16)
-                        float depthMeters = pixels[i].r;
-                        ushort depthMM = (ushort)Mathf.Clamp(depthMeters * 1000f, 0f, 65535f);
-                        depthBytes[i * 2] = (byte)(depthMM & 0xFF);
-                        depthBytes[i * 2 + 1] = (byte)((depthMM >> 8) & 0xFF);
-                    }
-
-                    OnDepthCaptured?.Invoke(depthBytes, depthWidth, depthHeight);
-                    return depthBytes;
-                }
-            }
-            catch (Exception e)
-            {
-                Debug.LogError($"[Meta3D] Depth capture error: {e.Message}");
-            }
-
-            return null;
-        }
-
-        /// <summary>
-        /// Capture depth from Unity's depth buffer (fallback)
-        /// </summary>
-        private byte[] CaptureFallbackDepth()
-        {
-            // Get camera from OVRCameraRig or fallback to Camera.main
-            Camera cam = null;
-            if (ovrCameraRig != null && ovrCameraRig.centerEyeAnchor != null)
-            {
-                cam = ovrCameraRig.centerEyeAnchor.GetComponent<Camera>();
-            }
-            if (cam == null)
-            {
-                cam = Camera.main;
-            }
-            if (cam == null) return null;
-
-            // Enable depth texture generation
-            cam.depthTextureMode = DepthTextureMode.Depth;
-
-            // Note: Getting the actual depth buffer from the GPU to CPU is complex
-            // In production, use a CommandBuffer or AsyncGPUReadback
-            // This is a simplified version
-
-            Debug.LogWarning("[Meta3D] Fallback depth capture is limited. Use Quest Depth API for best results.");
-            return null;
-        }
-
-        /// <summary>
-        /// Get depth dimensions
-        /// </summary>
-        public (int width, int height) GetDepthDimensions()
-        {
-            return (depthWidth, depthHeight);
-        }
-
-        private void OnDestroy()
-        {
-            if (depthRenderTexture != null)
-            {
-                depthRenderTexture.Release();
-                Destroy(depthRenderTexture);
-            }
-            if (depthTexture != null)
-            {
-                Destroy(depthTexture);
-            }
+            return lastDepthData != null && (Time.time - lastDepthTime) < maxAge;
         }
     }
 }

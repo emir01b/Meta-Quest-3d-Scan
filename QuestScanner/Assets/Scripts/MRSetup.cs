@@ -1,169 +1,70 @@
 /*
- * Meta3D Scanner - MR Setup
- * Initializes Mixed Reality Passthrough on Meta Quest.
- * Configures OVRManager, OVRPassthroughLayer, and camera transparency.
- * 
- * Attach this to the OVRCameraRig GameObject in your scene.
+ * MetaScan — MR Setup
+ * Configures Mixed Reality passthrough environment at runtime.
+ * Uses #if META_XR_SDK for OVR dependencies.
  */
 
 using UnityEngine;
 
-namespace Meta3DScanner
+namespace MetaScan
 {
-    [RequireComponent(typeof(OVRManager))]
     public class MRSetup : MonoBehaviour
     {
         [Header("Passthrough Settings")]
         [SerializeField] private bool enablePassthrough = true;
-        [SerializeField] private float passthroughOpacity = 1.0f;
-
-        [Header("References (Auto-found if empty)")]
-        [SerializeField] private OVRCameraRig cameraRig;
-        [SerializeField] private OVRPassthroughLayer passthroughLayer;
-
-        private OVRManager ovrManager;
 
         private void Awake()
         {
-            // Get OVRManager
-            ovrManager = GetComponent<OVRManager>();
-            if (ovrManager == null)
-            {
-                Debug.LogError("[Meta3D-MR] OVRManager not found on this GameObject!");
-                return;
-            }
-
-            // Get OVRCameraRig
-            if (cameraRig == null)
-            {
-                cameraRig = GetComponent<OVRCameraRig>();
-            }
-            if (cameraRig == null)
-            {
-                cameraRig = FindObjectOfType<OVRCameraRig>();
-            }
-
-            if (enablePassthrough)
-            {
-                ConfigurePassthrough();
-            }
+            ConfigurePassthrough();
         }
 
-        private void Start()
-        {
-            if (enablePassthrough)
-            {
-                ConfigureCameraBackground();
-            }
-
-            Debug.Log("[Meta3D-MR] MR Setup complete. Passthrough enabled: " + enablePassthrough);
-        }
-
-        /// <summary>
-        /// Configure OVRManager and OVRPassthroughLayer for passthrough MR.
-        /// </summary>
         private void ConfigurePassthrough()
         {
-            // Enable Insight Passthrough on OVRManager
-            OVRManager.isInsightPassthroughEnabled = true;
-
-            // Tracking origin type: Stage (standing use)
-            ovrManager.trackingOriginType = OVRManager.TrackingOrigin.Stage;
-
-            // Add OVRPassthroughLayer if not present
-            if (passthroughLayer == null)
+#if META_XR_SDK
+            // Configure OVRManager for passthrough
+            OVRManager ovrManager = FindFirstObjectByType<OVRManager>();
+            if (ovrManager == null)
             {
-                passthroughLayer = GetComponent<OVRPassthroughLayer>();
-            }
-            if (passthroughLayer == null)
-            {
-                passthroughLayer = gameObject.AddComponent<OVRPassthroughLayer>();
-            }
-
-            // Configure passthrough layer: Underlay = real world behind virtual objects
-            passthroughLayer.overlayType = OVROverlay.OverlayType.Underlay;
-            passthroughLayer.compositionDepth = 0;
-
-            // Set passthrough opacity
-            passthroughLayer.SetStyleToDefault(); // ensure default style first
-
-            Debug.Log("[Meta3D-MR] Passthrough configured: Underlay mode");
-        }
-
-        /// <summary>
-        /// Make the camera background transparent so passthrough shows through.
-        /// Must be called after OVRCameraRig initializes its cameras.
-        /// </summary>
-        private void ConfigureCameraBackground()
-        {
-            if (cameraRig == null)
-            {
-                Debug.LogWarning("[Meta3D-MR] OVRCameraRig not found, cannot configure camera background.");
+                Debug.LogError("[MetaScan-MR] OVRManager not found! Add OVRCameraRig to scene.");
                 return;
             }
 
-            // Set CenterEyeAnchor camera to solid color with alpha = 0
-            Camera centerEye = cameraRig.centerEyeAnchor.GetComponent<Camera>();
-            if (centerEye != null)
+            ovrManager.isInsightPassthroughEnabled = enablePassthrough;
+
+            // Add passthrough layer (SDK handles layering automatically)
+            OVRPassthroughLayer passthroughLayer = ovrManager.GetComponent<OVRPassthroughLayer>();
+            if (passthroughLayer == null)
             {
-                centerEye.clearFlags = CameraClearFlags.SolidColor;
-                centerEye.backgroundColor = new Color(0f, 0f, 0f, 0f);
-                Debug.Log("[Meta3D-MR] Camera background set to transparent");
+                passthroughLayer = ovrManager.gameObject.AddComponent<OVRPassthroughLayer>();
             }
 
-            // Also set left/right eye cameras if they exist
-            SetCameraTransparent(cameraRig.leftEyeAnchor);
-            SetCameraTransparent(cameraRig.rightEyeAnchor);
-        }
+            // Configure camera for passthrough (transparent background)
+            OVRCameraRig cameraRig = FindFirstObjectByType<OVRCameraRig>();
+            if (cameraRig != null && cameraRig.centerEyeAnchor != null)
+            {
+                Camera centerCamera = cameraRig.centerEyeAnchor.GetComponent<Camera>();
+                if (centerCamera != null)
+                {
+                    centerCamera.clearFlags = CameraClearFlags.SolidColor;
+                    centerCamera.backgroundColor = new Color(0, 0, 0, 0);
+                }
+            }
 
-        private void SetCameraTransparent(Transform eyeAnchor)
-        {
-            if (eyeAnchor == null) return;
+            // Set tracking origin to stage (standing use)
+            OVRManager.TrackingOrigin trackingOrigin = OVRManager.TrackingOrigin.Stage;
+            ovrManager.trackingOriginType = trackingOrigin;
 
-            Camera cam = eyeAnchor.GetComponent<Camera>();
+            Debug.Log("[MetaScan-MR] Passthrough configured: enabled=" + enablePassthrough);
+#else
+            Debug.LogWarning("[MetaScan-MR] META_XR_SDK not defined. Passthrough not available in Editor.");
+
+            // Editor fallback: set normal skybox
+            Camera cam = Camera.main;
             if (cam != null)
             {
-                cam.clearFlags = CameraClearFlags.SolidColor;
-                cam.backgroundColor = new Color(0f, 0f, 0f, 0f);
+                cam.clearFlags = CameraClearFlags.Skybox;
             }
-        }
-
-        /// <summary>
-        /// Toggle passthrough on/off at runtime.
-        /// </summary>
-        public void SetPassthroughEnabled(bool enabled)
-        {
-            enablePassthrough = enabled;
-            OVRManager.isInsightPassthroughEnabled = enabled;
-
-            if (passthroughLayer != null)
-            {
-                passthroughLayer.hidden = !enabled;
-            }
-
-            Debug.Log("[Meta3D-MR] Passthrough " + (enabled ? "enabled" : "disabled"));
-        }
-
-        /// <summary>
-        /// Set passthrough opacity (0.0 to 1.0).
-        /// </summary>
-        public void SetPassthroughOpacity(float opacity)
-        {
-            passthroughOpacity = Mathf.Clamp01(opacity);
-            if (passthroughLayer != null)
-            {
-                passthroughLayer.textureOpacity = passthroughOpacity;
-            }
-        }
-
-        public OVRCameraRig GetCameraRig()
-        {
-            return cameraRig;
-        }
-
-        public OVRPassthroughLayer GetPassthroughLayer()
-        {
-            return passthroughLayer;
+#endif
         }
     }
 }

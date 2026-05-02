@@ -1,15 +1,13 @@
 /*
- * Meta3D Scanner - Scan Manager
- * Main orchestrator for the scanning process in MR mode.
- * Connects HandUIManager, ControllerManager, ScanPointer,
- * PointCloudVisualizer, and data streaming components.
+ * MetaScan — Scan Manager
+ * Main orchestrator — coordinates all scanning components via state machine.
+ * States: Idle → Connecting → Connected → Selecting → Scanning → Processing → Complete
  */
 
 using System;
-using System.Collections;
 using UnityEngine;
 
-namespace Meta3DScanner
+namespace MetaScan
 {
     public class ScanManager : MonoBehaviour
     {
@@ -20,95 +18,63 @@ namespace Meta3DScanner
         [SerializeField] private ControllerManager controllerManager;
         [SerializeField] private HandUIManager handUIManager;
         [SerializeField] private ScanPointer scanPointer;
+        [SerializeField] private ObjectSelector objectSelector;
         [SerializeField] private PointCloudVisualizer pointCloudVisualizer;
 
         [Header("Scan Settings")]
         [SerializeField] private int minFramesRequired = 30;
         [SerializeField] private int targetFrames = 200;
-        [SerializeField] private float scanTimeout = 300f; // 5 minutes max
-
-        [Header("Audio Feedback")]
-        [SerializeField] private AudioSource audioSource;
-        [SerializeField] private AudioClip captureSound;
-        [SerializeField] private AudioClip warningSound;
-        [SerializeField] private AudioClip completeSound;
+        [SerializeField] private float scanTimeout = 300f;
 
         [Header("Colors")]
-        [SerializeField] private Color goodQualityColor = new Color(0.2f, 0.9f, 0.4f);
-        [SerializeField] private Color badQualityColor = new Color(1.0f, 0.3f, 0.3f);
-        [SerializeField] private Color warningColor = new Color(1.0f, 0.8f, 0.2f);
+        [SerializeField] private Color goodColor = new Color(0.2f, 0.9f, 0.4f);
+        [SerializeField] private Color badColor = new Color(1.0f, 0.3f, 0.3f);
+        [SerializeField] private Color warnColor = new Color(1.0f, 0.8f, 0.2f);
+        [SerializeField] private Color selectColor = new Color(1.0f, 0.6f, 0.0f);
 
-        // State
-        private enum ScanState
+        public enum ScanState
         {
-            Idle,
-            Connecting,
-            Connected,
-            Scanning,
-            Processing,
-            Complete,
-            Error
+            Idle, Connecting, Connected, Selecting, Scanning, Processing, Complete, Error
         }
-        private ScanState currentState = ScanState.Idle;
+
+        public ScanState CurrentState { get; private set; } = ScanState.Idle;
         private float scanStartTime;
-        private int qualityIssueCount = 0;
-
-        // Coverage tracking
-        private float[] coverageAngles;
-        private int coverageSections = 36;
-
-        // Head tracking for point cloud (OVRCameraRig)
-        private OVRCameraRig ovrCameraRig;
+        private Transform headTransform;
 
         private void Start()
         {
             FindComponents();
-            InitializeCoverage();
             SubscribeToEvents();
             SetState(ScanState.Idle);
-
-            // Try to add AudioSource if not assigned
-            if (audioSource == null)
-            {
-                audioSource = GetComponent<AudioSource>();
-                if (audioSource == null)
-                {
-                    audioSource = gameObject.AddComponent<AudioSource>();
-                    audioSource.playOnAwake = false;
-                    audioSource.spatialBlend = 0f; // 2D sound
-                }
-            }
-
-            Debug.Log("[Meta3D-ScanManager] Initialized in MR mode");
+            Debug.Log("[MetaScan-Manager] Initialized");
         }
 
         private void FindComponents()
         {
-            if (cameraCapture == null) cameraCapture = GetComponent<CameraCapture>();
-            if (cameraCapture == null) cameraCapture = FindObjectOfType<CameraCapture>();
+            if (cameraCapture == null) cameraCapture = FindFirstObjectByType<CameraCapture>();
+            if (depthCapture == null) depthCapture = FindFirstObjectByType<DepthCapture>();
+            if (dataStreamer == null) dataStreamer = FindFirstObjectByType<DataStreamer>();
+            if (controllerManager == null) controllerManager = FindFirstObjectByType<ControllerManager>();
+            if (handUIManager == null) handUIManager = FindFirstObjectByType<HandUIManager>();
+            if (scanPointer == null) scanPointer = FindFirstObjectByType<ScanPointer>();
+            if (objectSelector == null) objectSelector = FindFirstObjectByType<ObjectSelector>();
+            if (pointCloudVisualizer == null) pointCloudVisualizer = FindFirstObjectByType<PointCloudVisualizer>();
 
-            if (depthCapture == null) depthCapture = GetComponent<DepthCapture>();
-            if (depthCapture == null) depthCapture = FindObjectOfType<DepthCapture>();
-
-            if (dataStreamer == null) dataStreamer = GetComponent<DataStreamer>();
-            if (dataStreamer == null) dataStreamer = FindObjectOfType<DataStreamer>();
-
-            if (controllerManager == null) controllerManager = FindObjectOfType<ControllerManager>();
-            if (handUIManager == null) handUIManager = FindObjectOfType<HandUIManager>();
-            if (scanPointer == null) scanPointer = FindObjectOfType<ScanPointer>();
-            if (pointCloudVisualizer == null) pointCloudVisualizer = FindObjectOfType<PointCloudVisualizer>();
-
-            ovrCameraRig = FindObjectOfType<OVRCameraRig>();
-        }
-
-        private void InitializeCoverage()
-        {
-            coverageAngles = new float[coverageSections];
+            // Find head transform
+#if META_XR_SDK
+            OVRCameraRig rig = FindFirstObjectByType<OVRCameraRig>();
+            if (rig != null && rig.centerEyeAnchor != null)
+                headTransform = rig.centerEyeAnchor;
+            else
+#endif
+            {
+                Camera cam = Camera.main;
+                if (cam != null) headTransform = cam.transform;
+            }
         }
 
         private void SubscribeToEvents()
         {
-            // DataStreamer events
             if (dataStreamer != null)
             {
                 dataStreamer.OnConnected += OnServerConnected;
@@ -118,63 +84,80 @@ namespace Meta3DScanner
                 dataStreamer.OnError += OnServerError;
             }
 
-            // Hand UI events
             if (handUIManager != null)
             {
                 handUIManager.OnConnectRequested += OnConnectRequested;
+                handUIManager.OnSelectObjectRequested += OnSelectObjectRequested;
                 handUIManager.OnScanRequested += OnScanRequested;
                 handUIManager.OnStopRequested += OnStopRequested;
             }
 
-            // Controller events (Y button = toggle UI)
-            if (controllerManager != null)
+            if (objectSelector != null)
             {
-                controllerManager.OnLeftSecondaryButtonDown += OnToggleUI;
+                objectSelector.OnObjectSelected += OnObjectSelected;
             }
         }
 
-        // =================================================================
-        // State Management
-        // =================================================================
+        // ================== State Machine ==================
 
         private void SetState(ScanState newState)
         {
-            currentState = newState;
+            CurrentState = newState;
             UpdateUI();
+            Debug.Log($"[MetaScan-Manager] State → {newState}");
         }
 
         private void UpdateUI()
         {
             if (handUIManager == null) return;
 
-            switch (currentState)
+            switch (CurrentState)
             {
                 case ScanState.Idle:
-                    handUIManager.SetStatus("Hazır", Color.white);
-                    handUIManager.SetInstruction("Sunucuya bağlanmak için Bağlan'a basın");
+                    handUIManager.SetStatus("Hazir", Color.white);
+                    handUIManager.SetInstruction("Sunucuya baglanmak icin Baglan'a basin");
                     handUIManager.SetConnectButtonEnabled(true);
+                    handUIManager.SetSelectButtonEnabled(false);
                     handUIManager.SetScanButtonsState(false, false);
                     handUIManager.SetConnectionStatus(false);
                     if (scanPointer != null) scanPointer.SetRayActive(false);
                     break;
 
                 case ScanState.Connecting:
-                    handUIManager.SetStatus("Bağlanıyor...", warningColor);
-                    handUIManager.SetInstruction("Sunucuya bağlanılıyor...");
+                    handUIManager.SetStatus("Baglaniyor...", warnColor);
+                    handUIManager.SetInstruction("Sunucuya baglaniyor...");
                     handUIManager.SetConnectButtonEnabled(false);
                     break;
 
                 case ScanState.Connected:
-                    handUIManager.SetStatus("Bağlı", goodQualityColor);
-                    handUIManager.SetInstruction("Taramaya başlamak için ▶ Tara'ya basın");
+                    handUIManager.SetStatus("Bagli", goodColor);
+                    handUIManager.SetInstruction("Cisim Sec ile taranacak nesneyi belirleyin");
                     handUIManager.SetConnectionStatus(true);
-                    handUIManager.SetScanButtonsState(true, false);
-                    if (scanPointer != null) scanPointer.SetRayActive(true);
+                    handUIManager.SetSelectButtonEnabled(true);
+                    handUIManager.SetScanButtonsState(false, false);
+                    if (scanPointer != null)
+                    {
+                        scanPointer.SetRayActive(true);
+                        scanPointer.SetSelectMode(false);
+                    }
+                    break;
+
+                case ScanState.Selecting:
+                    handUIManager.SetStatus("Cisim Secimi", selectColor);
+                    handUIManager.SetInstruction("Sag tetik ile nesneye isaret edip basili tutun, surukleyerek alani belirleyin");
+                    handUIManager.SetSelectButtonEnabled(false);
+                    handUIManager.SetScanButtonsState(false, false);
+                    if (scanPointer != null)
+                    {
+                        scanPointer.SetRayActive(true);
+                        scanPointer.SetSelectMode(true);
+                    }
                     break;
 
                 case ScanState.Scanning:
-                    handUIManager.SetStatus("Taranıyor...", goodQualityColor);
-                    handUIManager.SetInstruction("Nesneyi sağ kontrol ile tarayın.\nYavaş ve düzgün hareket edin.");
+                    handUIManager.SetStatus("Taraniyor...", goodColor);
+                    handUIManager.SetInstruction("Nesneyi sag kontrol ile tarayin. Etrafinda dolasin.");
+                    handUIManager.SetSelectButtonEnabled(false);
                     handUIManager.SetScanButtonsState(false, true);
                     if (scanPointer != null)
                     {
@@ -184,8 +167,9 @@ namespace Meta3DScanner
                     break;
 
                 case ScanState.Processing:
-                    handUIManager.SetStatus("İşleniyor...", warningColor);
-                    handUIManager.SetInstruction("3D model oluşturuluyor, lütfen bekleyin...");
+                    handUIManager.SetStatus("Isleniyor...", warnColor);
+                    handUIManager.SetInstruction("3D model olusturuluyor...");
+                    handUIManager.SetSelectButtonEnabled(false);
                     handUIManager.SetScanButtonsState(false, false);
                     if (scanPointer != null)
                     {
@@ -195,23 +179,22 @@ namespace Meta3DScanner
                     break;
 
                 case ScanState.Complete:
-                    handUIManager.SetStatus("Tamamlandı!", goodQualityColor);
-                    handUIManager.SetInstruction("3D model başarıyla oluşturuldu!");
-                    handUIManager.SetScanButtonsState(true, false);
-                    PlaySound(completeSound);
+                    handUIManager.SetStatus("Tamamlandi!", goodColor);
+                    handUIManager.SetInstruction("3D model olusturuldu! Web viewer'da goruntuleyebilirsiniz.");
+                    handUIManager.SetSelectButtonEnabled(true);
+                    handUIManager.SetScanButtonsState(false, false);
                     break;
 
                 case ScanState.Error:
-                    handUIManager.SetStatus("Hata!", badQualityColor);
+                    handUIManager.SetStatus("Hata!", badColor);
                     handUIManager.SetConnectButtonEnabled(true);
+                    handUIManager.SetSelectButtonEnabled(false);
                     handUIManager.SetScanButtonsState(false, false);
                     break;
             }
         }
 
-        // =================================================================
-        // UI Event Handlers (from HandUIManager)
-        // =================================================================
+        // ================== UI Callbacks ==================
 
         private void OnConnectRequested(string ip, int port)
         {
@@ -220,239 +203,159 @@ namespace Meta3DScanner
             dataStreamer.Connect();
         }
 
+        private void OnSelectObjectRequested()
+        {
+            SetState(ScanState.Selecting);
+            if (objectSelector != null)
+                objectSelector.StartSelecting();
+            if (pointCloudVisualizer != null)
+                pointCloudVisualizer.ClearPoints();
+        }
+
+        private void OnObjectSelected(Vector3 center, float radius)
+        {
+            // Object selected — enable scan button
+            if (handUIManager != null)
+            {
+                handUIManager.SetStatus("Cisim Secildi", goodColor);
+                handUIManager.SetInstruction(
+                    $"Alan secildi (r={radius:F2}m). Taramayi Baslat'a basin.");
+                handUIManager.SetScanButtonsState(true, false);
+            }
+
+            // Stop selection mode on pointer
+            if (scanPointer != null) scanPointer.SetSelectMode(false);
+            if (objectSelector != null) objectSelector.StopSelecting();
+
+            // Haptic feedback
+            if (controllerManager != null)
+                controllerManager.SendHaptic(false, 0.5f, 0.7f, 0.2f);
+        }
+
         private void OnScanRequested()
         {
             SetState(ScanState.Scanning);
             scanStartTime = Time.time;
-            qualityIssueCount = 0;
-            coverageAngles = new float[coverageSections];
 
-            // Clear previous point cloud
-            if (pointCloudVisualizer != null)
-            {
-                pointCloudVisualizer.ClearPoints();
-            }
+            // Start camera capture
+            if (cameraCapture != null) cameraCapture.StartCapturing();
 
+            // Start streaming session
             dataStreamer.StartSession("scan");
         }
 
         private void OnStopRequested()
         {
+            // Stop scanning
             if (scanPointer != null) scanPointer.StopScanning();
+            if (cameraCapture != null) cameraCapture.StopCapturing();
             dataStreamer.StopSession();
 
             if (dataStreamer.FramesSent >= minFramesRequired)
             {
                 SetState(ScanState.Processing);
                 if (handUIManager != null)
-                {
                     handUIManager.SetInstruction(
-                        $"{dataStreamer.FramesSent} frame kaydedildi.\nPC'de rekonstrüksiyon başlatılıyor...");
-                }
+                        dataStreamer.FramesSent + " frame kaydedildi. 3D model olusturuluyor...");
             }
             else
             {
                 if (handUIManager != null)
-                {
                     handUIManager.SetInstruction(
-                        $"Yetersiz frame ({dataStreamer.FramesSent}/{minFramesRequired}).\nDaha fazla tarama yapın.");
-                }
+                        "Yetersiz frame (" + dataStreamer.FramesSent + "/" + minFramesRequired + ").");
                 SetState(ScanState.Connected);
             }
         }
 
-        private void OnToggleUI()
-        {
-            if (handUIManager != null)
-            {
-                handUIManager.ToggleVisible();
-            }
-        }
-
-        // =================================================================
-        // Server Event Handlers
-        // =================================================================
+        // ================== Server Events ==================
 
         private void OnServerConnected(string url)
         {
             SetState(ScanState.Connected);
-            Debug.Log($"[Meta3D-ScanManager] Connected to: {url}");
         }
 
         private void OnServerDisconnected(string reason)
         {
             SetState(ScanState.Idle);
             if (scanPointer != null) scanPointer.StopScanning();
+            if (cameraCapture != null) cameraCapture.StopCapturing();
         }
 
-        private void OnSessionStarted(string sessionId)
+        private void OnSessionStarted(string id)
         {
-            Debug.Log($"[Meta3D-ScanManager] Session: {sessionId}");
+            Debug.Log("[MetaScan-Manager] Session: " + id);
         }
 
-        private void OnFrameFeedback(DataStreamer.FrameFeedback feedback)
+        private void OnFrameFeedback(DataStreamer.FrameFeedback fb)
         {
             if (handUIManager == null) return;
 
-            // Update frame counter
-            handUIManager.SetFrameCount(feedback.total_frames, targetFrames);
+            handUIManager.SetFrameCount(fb.total_frames, targetFrames);
+            handUIManager.SetProgress(Mathf.Clamp01((float)fb.total_frames / targetFrames));
 
-            // Update progress
-            handUIManager.SetProgress(Mathf.Clamp01((float)feedback.total_frames / targetFrames));
-
-            // Update quality indicator
-            if (feedback.quality_ok)
+            if (fb.quality_ok)
             {
-                handUIManager.SetQuality("Kalite: İyi", goodQualityColor);
+                handUIManager.SetQuality("Kalite: Iyi", goodColor);
             }
             else
             {
-                string issues = string.Join(", ", feedback.quality_issues ?? new string[0]);
-                handUIManager.SetQuality($"Kalite: {issues}", badQualityColor);
-                qualityIssueCount++;
-                PlaySound(warningSound);
+                string issues = fb.quality_issues != null && fb.quality_issues.Length > 0
+                    ? string.Join(", ", fb.quality_issues)
+                    : "unknown";
+                handUIManager.SetQuality("Kalite: " + issues, badColor);
             }
 
-            // Add points to point cloud based on camera position
-            AddPointsFromFrame(feedback.quality_ok);
+            // Add visualization points
+            AddPointsFromFrame(fb.quality_ok);
 
-            // Update coverage
-            UpdateCoverage();
-
-            // Check if enough frames
-            if (feedback.total_frames >= targetFrames)
+            if (fb.total_frames >= targetFrames)
             {
-                handUIManager.SetInstruction("Yeterli frame toplandı! Durdurmak için ■ Dur'a basın.");
-                PlaySound(captureSound);
+                handUIManager.SetInstruction("Yeterli frame toplandi! Dur'a basin.");
+                // Haptic notification
+                if (controllerManager != null)
+                    controllerManager.SendHaptic(true, 0.3f, 0.5f, 0.3f);
             }
         }
 
-        private void OnServerError(string error)
+        private void OnServerError(string err)
         {
-            Debug.LogError($"[Meta3D-ScanManager] Error: {error}");
+            Debug.LogError("[MetaScan-Manager] Error: " + err);
             if (handUIManager != null)
-            {
-                handUIManager.SetInstruction($"Hata: {error}");
-            }
+                handUIManager.SetInstruction("Hata: " + err);
             SetState(ScanState.Error);
         }
 
-        // =================================================================
-        // Point Cloud from Frame
-        // =================================================================
+        // ================== Point Cloud ==================
 
         private void AddPointsFromFrame(bool qualityOk)
         {
-            if (pointCloudVisualizer == null) return;
+            if (pointCloudVisualizer == null || headTransform == null) return;
 
-            // Get camera transform from OVRCameraRig
-            Transform camTransform = null;
-            if (ovrCameraRig != null && ovrCameraRig.centerEyeAnchor != null)
-            {
-                camTransform = ovrCameraRig.centerEyeAnchor;
-            }
-            else
-            {
-                Camera mainCam = Camera.main;
-                if (mainCam != null) camTransform = mainCam.transform;
-            }
-
-            if (camTransform == null) return;
-
-            // Estimate surface distance (use scan pointer hit if available or default)
-            float hitDistance = 0f;
+            float hitDist = 0f;
             if (scanPointer != null && scanPointer.HasHit)
-            {
-                hitDistance = scanPointer.GetHitDistance();
-            }
+                hitDist = scanPointer.GetHitDistance();
 
             pointCloudVisualizer.AddFramePoints(
-                camTransform.position,
-                camTransform.forward,
-                camTransform.right,
-                camTransform.up,
-                qualityOk,
-                hitDistance
-            );
+                headTransform.position, headTransform.forward,
+                headTransform.right, headTransform.up,
+                qualityOk, hitDist);
         }
 
-        // =================================================================
-        // Coverage Tracking
-        // =================================================================
-
-        private void UpdateCoverage()
-        {
-            Transform camTransform = null;
-            if (ovrCameraRig != null && ovrCameraRig.centerEyeAnchor != null)
-            {
-                camTransform = ovrCameraRig.centerEyeAnchor;
-            }
-            else
-            {
-                Camera cam = Camera.main;
-                if (cam != null) camTransform = cam.transform;
-            }
-
-            if (camTransform == null) return;
-
-            Vector3 forward = camTransform.forward;
-            float angle = Mathf.Atan2(forward.x, forward.z) * Mathf.Rad2Deg;
-            if (angle < 0) angle += 360f;
-
-            int section = Mathf.FloorToInt(angle / (360f / coverageSections));
-            section = Mathf.Clamp(section, 0, coverageSections - 1);
-            coverageAngles[section] = 1f;
-        }
-
-        /// <summary>
-        /// Get coverage percentage (0-100).
-        /// </summary>
-        public float GetCoveragePercent()
-        {
-            if (coverageAngles == null) return 0;
-            float covered = 0;
-            foreach (float v in coverageAngles)
-            {
-                if (v > 0.5f) covered++;
-            }
-            return (covered / coverageSections) * 100f;
-        }
-
-        // =================================================================
-        // Audio
-        // =================================================================
-
-        private void PlaySound(AudioClip clip)
-        {
-            if (audioSource != null && clip != null)
-            {
-                audioSource.PlayOneShot(clip);
-            }
-        }
-
-        // =================================================================
-        // Update Loop
-        // =================================================================
+        // ================== Update ==================
 
         private void Update()
         {
-            if (currentState == ScanState.Scanning)
+            if (CurrentState == ScanState.Scanning
+                && Time.time - scanStartTime > scanTimeout)
             {
-                // Check timeout
-                if (Time.time - scanStartTime > scanTimeout)
-                {
-                    if (handUIManager != null)
-                    {
-                        handUIManager.SetInstruction("Tarama zaman aşımına uğradı.");
-                    }
-                    OnStopRequested();
-                }
+                if (handUIManager != null)
+                    handUIManager.SetInstruction("Tarama zaman asimina ugradi.");
+                OnStopRequested();
             }
         }
 
         private void OnDestroy()
         {
-            // Unsubscribe from events
             if (dataStreamer != null)
             {
                 dataStreamer.OnConnected -= OnServerConnected;
@@ -461,17 +364,16 @@ namespace Meta3DScanner
                 dataStreamer.OnFrameFeedback -= OnFrameFeedback;
                 dataStreamer.OnError -= OnServerError;
             }
-
             if (handUIManager != null)
             {
                 handUIManager.OnConnectRequested -= OnConnectRequested;
+                handUIManager.OnSelectObjectRequested -= OnSelectObjectRequested;
                 handUIManager.OnScanRequested -= OnScanRequested;
                 handUIManager.OnStopRequested -= OnStopRequested;
             }
-
-            if (controllerManager != null)
+            if (objectSelector != null)
             {
-                controllerManager.OnLeftSecondaryButtonDown -= OnToggleUI;
+                objectSelector.OnObjectSelected -= OnObjectSelected;
             }
         }
     }

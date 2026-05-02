@@ -1,20 +1,17 @@
-# Web Server
+# MetaScan Server Dependencies
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
 websockets==14.1
-python-multipart==0.0.18
+python-multipart==0.0.20
 
-# Image Processing
+# Image & Data Processing
 opencv-python-headless==4.10.0.84
-numpy==1.26.4
-Pillow==11.1.0
+numpy>=1.26.0
+Pillow>=10.0.0
 
 # 3D Reconstruction
-open3d==0.18.0
-trimesh==4.5.3
-pygltflib==1.16.4
+open3d>=0.18.0
+trimesh>=4.0.0
 
 # Utilities
-pydantic==2.10.4
 aiofiles==24.1.0
-tqdm==4.67.1

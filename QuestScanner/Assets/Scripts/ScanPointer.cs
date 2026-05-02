@@ -1,228 +1,164 @@
 /*
- * Meta3D Scanner - Scan Pointer
- * Ray from right controller for selecting and scanning objects.
- * Shows a visual laser pointer with LineRenderer.
- * 
- * Trigger = Start/Pause scanning on the aimed area.
+ * MetaScan — Scan Pointer
+ * Right controller laser pointer for targeting objects and scanning areas.
+ * Uses LineRenderer for visual ray and shows hit point effects.
  */
 
 using UnityEngine;
 
-namespace Meta3DScanner
+namespace MetaScan
 {
     public class ScanPointer : MonoBehaviour
     {
         [Header("References")]
         [SerializeField] private ControllerManager controllerManager;
-        [SerializeField] private PointCloudVisualizer pointCloudVisualizer;
 
         [Header("Ray Settings")]
-        [SerializeField] private float maxRayDistance = 5.0f;
+        [SerializeField] private float maxRayDistance = 10f;
         [SerializeField] private float rayWidth = 0.003f;
-        [SerializeField] private LayerMask raycastMask = ~0; // Everything
+        [SerializeField] private Color idleColor = new Color(0.3f, 0.5f, 1.0f, 0.6f);
+        [SerializeField] private Color scanColor = new Color(0.2f, 1.0f, 0.4f, 0.8f);
+        [SerializeField] private Color selectColor = new Color(1.0f, 0.6f, 0.0f, 0.8f);
 
-        [Header("Visual Settings")]
-        [SerializeField] private Color idleRayColor = new Color(0.5f, 0.8f, 1.0f, 0.6f);
-        [SerializeField] private Color scanningRayColor = new Color(0.2f, 1.0f, 0.5f, 0.9f);
-        [SerializeField] private Color hitPointColor = new Color(0.0f, 1.0f, 0.7f, 1.0f);
-        [SerializeField] private float hitDotSize = 0.01f;
-
-        // Components
-        private LineRenderer lineRenderer;
-        private GameObject hitDotObject;
-        private MeshRenderer hitDotRenderer;
+        [Header("Hit Point")]
+        [SerializeField] private float hitDotSize = 0.015f;
+        [SerializeField] private Color hitDotColor = new Color(1f, 1f, 1f, 0.9f);
 
         // State
-        private bool isScanning = false;
-        private bool isRayActive = true;
-        private Vector3 lastHitPoint;
-        private Vector3 lastHitNormal;
-        private bool hasHit = false;
+        public bool IsRayActive { get; private set; }
+        public bool IsScanning { get; private set; }
+        public bool IsInSelectMode { get; set; }
+        public bool HasHit { get; private set; }
+        public Vector3 HitPoint { get; private set; }
+        public Vector3 HitNormal { get; private set; }
 
-        // Events
-        public event System.Action<Vector3, Vector3> OnScanPointCaptured; // position, normal
-
-        public bool IsScanning => isScanning;
-        public bool HasHit => hasHit;
-        public Vector3 LastHitPoint => lastHitPoint;
-        public Vector3 LastHitNormal => lastHitNormal;
+        private LineRenderer lineRenderer;
+        private GameObject hitDot;
+        private MeshRenderer hitDotRenderer;
+        private Transform rayOrigin;
 
         private void Start()
         {
             if (controllerManager == null)
-            {
-                controllerManager = FindObjectOfType<ControllerManager>();
-            }
-            if (pointCloudVisualizer == null)
-            {
-                pointCloudVisualizer = FindObjectOfType<PointCloudVisualizer>();
-            }
+                controllerManager = FindFirstObjectByType<ControllerManager>();
 
-            CreateLineRenderer();
+            CreateRayVisual();
             CreateHitDot();
-
-            Debug.Log("[Meta3D-Pointer] Scan pointer initialized");
+            SetRayActive(false);
         }
 
-        private void CreateLineRenderer()
+        private void CreateRayVisual()
         {
-            // Create LineRenderer on this object
-            lineRenderer = gameObject.AddComponent<LineRenderer>();
+            GameObject rayObj = new GameObject("ScanRay");
+            rayObj.transform.SetParent(transform, false);
+
+            lineRenderer = rayObj.AddComponent<LineRenderer>();
             lineRenderer.positionCount = 2;
             lineRenderer.startWidth = rayWidth;
             lineRenderer.endWidth = rayWidth * 0.5f;
+            lineRenderer.material = new Material(Shader.Find("Sprites/Default"));
+            lineRenderer.startColor = idleColor;
+            lineRenderer.endColor = idleColor * 0.3f;
             lineRenderer.useWorldSpace = true;
-            lineRenderer.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
-            lineRenderer.receiveShadows = false;
-
-            // Create a simple material for the ray
-            Material rayMat = new Material(Shader.Find("Sprites/Default"));
-            rayMat.color = idleRayColor;
-            lineRenderer.material = rayMat;
-            lineRenderer.startColor = idleRayColor;
-            lineRenderer.endColor = idleRayColor * 0.5f;
-
             lineRenderer.enabled = false;
         }
 
         private void CreateHitDot()
         {
-            hitDotObject = GameObject.CreatePrimitive(PrimitiveType.Sphere);
-            hitDotObject.name = "ScanPointer_HitDot";
-            hitDotObject.transform.localScale = Vector3.one * hitDotSize;
+            hitDot = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+            hitDot.name = "HitDot";
+            hitDot.transform.SetParent(transform, false);
+            hitDot.transform.localScale = Vector3.one * hitDotSize;
 
-            // Remove collider (we don't want to hit the dot itself)
-            Collider col = hitDotObject.GetComponent<Collider>();
+            // Remove collider to avoid interference
+            Collider col = hitDot.GetComponent<Collider>();
             if (col != null) Destroy(col);
 
-            // Set material
-            hitDotRenderer = hitDotObject.GetComponent<MeshRenderer>();
-            Material dotMat = new Material(Shader.Find("Sprites/Default"));
-            dotMat.color = hitPointColor;
-            hitDotRenderer.material = dotMat;
-            hitDotRenderer.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
-            hitDotRenderer.receiveShadows = false;
-
-            hitDotObject.SetActive(false);
+            hitDotRenderer = hitDot.GetComponent<MeshRenderer>();
+            hitDotRenderer.material = new Material(Shader.Find("Sprites/Default"));
+            hitDotRenderer.material.color = hitDotColor;
+            hitDot.SetActive(false);
         }
 
         private void Update()
         {
-            if (!isRayActive || controllerManager == null) return;
+            if (!IsRayActive || controllerManager == null) return;
 
-            UpdateRaycast();
+            UpdateRay();
         }
 
-        private void UpdateRaycast()
+        private void UpdateRay()
         {
-            Ray ray = controllerManager.GetRightControllerRay();
-            RaycastHit hit;
+            // Get ray from right controller
+            rayOrigin = controllerManager.RightHandAnchor;
+            if (rayOrigin == null) return;
 
-            lineRenderer.enabled = true;
-            lineRenderer.SetPosition(0, ray.origin);
+            Ray ray = new Ray(rayOrigin.position, rayOrigin.forward);
+            Vector3 endPoint;
 
-            if (Physics.Raycast(ray, out hit, maxRayDistance, raycastMask))
+            // Raycast against scene
+            if (Physics.Raycast(ray, out RaycastHit hit, maxRayDistance))
             {
-                hasHit = true;
-                lastHitPoint = hit.point;
-                lastHitNormal = hit.normal;
-
-                // Update line endpoint to hit point
-                lineRenderer.SetPosition(1, hit.point);
+                HasHit = true;
+                HitPoint = hit.point;
+                HitNormal = hit.normal;
+                endPoint = hit.point;
 
                 // Show hit dot
-                hitDotObject.SetActive(true);
-                hitDotObject.transform.position = hit.point;
-                hitDotObject.transform.up = hit.normal;
-
-                // If scanning, add points at the hit location
-                if (isScanning)
-                {
-                    AddScanPoint(hit.point, hit.normal);
-                }
+                hitDot.SetActive(true);
+                hitDot.transform.position = hit.point;
+                hitDot.transform.up = hit.normal;
             }
             else
             {
-                hasHit = false;
-                lineRenderer.SetPosition(1, ray.origin + ray.direction * maxRayDistance);
-                hitDotObject.SetActive(false);
+                HasHit = false;
+                endPoint = ray.origin + ray.direction * maxRayDistance;
+                hitDot.SetActive(false);
             }
 
-            // Update ray color based on scan state
-            Color targetColor = isScanning ? scanningRayColor : idleRayColor;
-            lineRenderer.startColor = targetColor;
-            lineRenderer.endColor = targetColor * 0.5f;
-            lineRenderer.material.color = targetColor;
+            // Update line
+            lineRenderer.SetPosition(0, ray.origin);
+            lineRenderer.SetPosition(1, endPoint);
+
+            // Update color based on mode
+            Color currentColor = IsInSelectMode ? selectColor : (IsScanning ? scanColor : idleColor);
+            lineRenderer.startColor = currentColor;
+            lineRenderer.endColor = currentColor * 0.3f;
         }
 
-        private void AddScanPoint(Vector3 position, Vector3 normal)
-        {
-            // Throttle: add point every few frames to avoid overwhelming the visualizer
-            if (Time.frameCount % 3 != 0) return;
+        // =========================================================
+        // Public API
+        // =========================================================
 
-            if (pointCloudVisualizer != null)
-            {
-                // Default to good quality green color
-                Color pointColor = new Color(0.2f, 0.9f, 0.4f);
-                pointCloudVisualizer.AddPoint(position, pointColor);
-            }
-
-            OnScanPointCaptured?.Invoke(position, normal);
-
-            // Haptic feedback per scan point
-            if (controllerManager != null)
-            {
-                controllerManager.PulseScanHaptic();
-            }
-        }
-
-        /// <summary>
-        /// Start scanning (called when scan session begins).
-        /// </summary>
-        public void StartScanning()
-        {
-            isScanning = true;
-            Debug.Log("[Meta3D-Pointer] Scanning started");
-        }
-
-        /// <summary>
-        /// Stop scanning.
-        /// </summary>
-        public void StopScanning()
-        {
-            isScanning = false;
-            Debug.Log("[Meta3D-Pointer] Scanning stopped");
-        }
-
-        /// <summary>
-        /// Show or hide the ray.
-        /// </summary>
         public void SetRayActive(bool active)
         {
-            isRayActive = active;
-            if (!active)
-            {
-                lineRenderer.enabled = false;
-                hitDotObject.SetActive(false);
-            }
+            IsRayActive = active;
+            if (lineRenderer != null) lineRenderer.enabled = active;
+            if (hitDot != null) hitDot.SetActive(false);
+            if (!active) HasHit = false;
         }
 
-        /// <summary>
-        /// Get the current hit distance.
-        /// </summary>
+        public void StartScanning()
+        {
+            IsScanning = true;
+            IsInSelectMode = false;
+        }
+
+        public void StopScanning()
+        {
+            IsScanning = false;
+        }
+
+        public void SetSelectMode(bool selectMode)
+        {
+            IsInSelectMode = selectMode;
+            IsScanning = false;
+        }
+
         public float GetHitDistance()
         {
-            if (!hasHit || controllerManager == null) return maxRayDistance;
-            Ray ray = controllerManager.GetRightControllerRay();
-            return Vector3.Distance(ray.origin, lastHitPoint);
-        }
-
-        private void OnDestroy()
-        {
-            if (hitDotObject != null)
-            {
-                Destroy(hitDotObject);
-            }
+            if (!HasHit || rayOrigin == null) return 0f;
+            return Vector3.Distance(rayOrigin.position, HitPoint);
         }
     }
 }

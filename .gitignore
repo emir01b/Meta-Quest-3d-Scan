@@ -1,0 +1,54 @@
+# =============================================================================
+# Unity (QuestScanner) — asla repo’ya alınmayacak çıktılar
+# =============================================================================
+QuestScanner/Library/
+QuestScanner/Temp/
+QuestScanner/obj/
+QuestScanner/Build/
+QuestScanner/Builds/
+QuestScanner/Logs/
+QuestScanner/UserSettings/
+QuestScanner/.utmp/
+QuestScanner/MemoryCaptures/
+QuestScanner/[Bb]urst*/
+QuestScanner**/Recordings/
+
+# Unity/OS
+*.apk
+*.aab
+*.app
+*.unitypackage
+
+# Rider / VS
+.vs/
+*.csproj.user
+*.DotSettings.user
+.idea/
+
+# =============================================================================
+# Python (server)
+# =============================================================================
+server/.venv/
+server/venv/
+**/__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Çalışma sırasında üretilen tarama verisi (istemci/repo boyutu için)
+server/data/sessions/
+server/data/exports/
+
+# Opsiyonel: ortam dosyası
+.env
+.env.local
+
+# =============================================================================
+# Genel
+# =============================================================================
+Thumbs.db
+Desktop.ini
+.DS_Store
+*.log

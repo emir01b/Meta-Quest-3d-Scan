@@ -1,297 +1,164 @@
 /*
- * Meta3D Scanner - Point Cloud Visualizer
- * Displays scan progress as colored dots (particles) in 3D space.
- * Uses Unity ParticleSystem for efficient rendering on Quest.
- * 
- * Green = good quality, Yellow = medium, Red = low quality.
+ * MetaScan — Point Cloud Visualizer
+ * Displays scanned points as a particle system.
+ * Color-coded by quality: green = good, yellow = medium, red = poor.
  */
 
-using System.Collections.Generic;
 using UnityEngine;
 
-namespace Meta3DScanner
+namespace MetaScan
 {
     public class PointCloudVisualizer : MonoBehaviour
     {
-        [Header("Point Cloud Settings")]
-        [SerializeField] private float pointSize = 0.006f;
+        [Header("Settings")]
         [SerializeField] private int maxPoints = 50000;
-        [SerializeField] private float headCaptureRadius = 0.3f; // Radius around head gaze to add points
+        [SerializeField] private float pointSize = 0.008f;
+        [SerializeField] private Color goodColor = new Color(0.2f, 0.9f, 0.4f, 0.9f);
+        [SerializeField] private Color mediumColor = new Color(1.0f, 0.8f, 0.2f, 0.7f);
+        [SerializeField] private Color poorColor = new Color(1.0f, 0.3f, 0.3f, 0.6f);
 
-        [Header("Colors")]
-        [SerializeField] private Color goodQualityColor = new Color(0.2f, 0.95f, 0.4f);
-        [SerializeField] private Color mediumQualityColor = new Color(1.0f, 0.85f, 0.2f);
-        [SerializeField] private Color lowQualityColor = new Color(1.0f, 0.3f, 0.2f);
-        [SerializeField] private Color defaultColor = new Color(0.4f, 0.8f, 1.0f);
+        [Header("Point Distribution")]
+        [SerializeField] private int pointsPerFrame = 20;
+        [SerializeField] private float pointSpread = 0.3f;
+        [SerializeField] private float pointNoise = 0.02f;
 
-        [Header("Animation")]
-        [SerializeField] private float fadeInDuration = 0.3f;
-        [SerializeField] private float pulseSpeed = 2.0f;
-        [SerializeField] private float pulseAmplitude = 0.002f;
-
-        // ParticleSystem for rendering points
-        private ParticleSystem particleSys;
-        private ParticleSystemRenderer particleRenderer;
+        // Particle system
+        private ParticleSystem _ps;
         private ParticleSystem.Particle[] particles;
+        private int currentPointCount;
 
-        // Point data storage
-        private List<Vector3> pointPositions = new List<Vector3>();
-        private List<Color> pointColors = new List<Color>();
-        private int currentPointCount = 0;
-
-        // Stats
-        private int goodQualityCount;
-        private int mediumQualityCount;
-        private int lowQualityCount;
-
-        public int PointCount => currentPointCount;
-        public int GoodQualityCount => goodQualityCount;
-        public int TotalCapacity => maxPoints;
+        // Reference to object selector for bounded visualization
+        private ObjectSelector objectSelector;
 
         private void Start()
         {
+            objectSelector = FindFirstObjectByType<ObjectSelector>();
             CreateParticleSystem();
-            Debug.Log("[Meta3D-PointCloud] Point cloud visualizer initialized");
         }
 
         private void CreateParticleSystem()
         {
-            // Create a child GameObject for the particle system
-            GameObject psObj = new GameObject("PointCloud_Particles");
+            GameObject psObj = new GameObject("PointCloud");
             psObj.transform.SetParent(transform, false);
-            psObj.transform.localPosition = Vector3.zero;
-            psObj.transform.localRotation = Quaternion.identity;
 
-            particleSys = psObj.AddComponent<ParticleSystem>();
+            _ps = psObj.AddComponent<ParticleSystem>();
 
-            // Stop the auto-play
-            particleSys.Stop();
+            // Stop default emission
+            var emission = _ps.emission;
+            emission.enabled = false;
 
-            // Main module - particles live forever
-            var main = particleSys.main;
-            main.maxParticles = maxPoints;
+            // Main module
+            var main = _ps.main;
             main.startLifetime = float.MaxValue;
-            main.startSpeed = 0f;
+            main.startSpeed = 0;
             main.startSize = pointSize;
-            main.startColor = defaultColor;
+            main.maxParticles = maxPoints;
             main.simulationSpace = ParticleSystemSimulationSpace.World;
             main.playOnAwake = false;
             main.loop = false;
 
-            // Disable all default modules
-            var emission = particleSys.emission;
-            emission.enabled = false;
-
-            var shape = particleSys.shape;
+            // Shape — disable
+            var shape = _ps.shape;
             shape.enabled = false;
 
-            var velocityOverLifetime = particleSys.velocityOverLifetime;
-            velocityOverLifetime.enabled = false;
+            // Renderer
+            var renderer = psObj.GetComponent<ParticleSystemRenderer>();
+            renderer.renderMode = ParticleSystemRenderMode.Billboard;
+            renderer.material = new Material(Shader.Find("Particles/Standard Unlit"));
+            renderer.material.SetFloat("_Mode", 0); // Opaque-ish
 
-            var colorOverLifetime = particleSys.colorOverLifetime;
-            colorOverLifetime.enabled = false;
-
-            var sizeOverLifetime = particleSys.sizeOverLifetime;
-            sizeOverLifetime.enabled = false;
-
-            var noise = particleSys.noise;
-            noise.enabled = false;
-
-            // Renderer - use simple billboard
-            particleRenderer = psObj.GetComponent<ParticleSystemRenderer>();
-            particleRenderer.renderMode = ParticleSystemRenderMode.Billboard;
-            particleRenderer.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
-            particleRenderer.receiveShadows = false;
-
-            // Create a simple unlit material for particles
-            Material particleMat = new Material(Shader.Find("Particles/Standard Unlit"));
-            particleMat.SetFloat("_Mode", 0); // Opaque
-            particleMat.color = Color.white;
-            particleRenderer.material = particleMat;
-
-            // Allocate particle array
             particles = new ParticleSystem.Particle[maxPoints];
+            currentPointCount = 0;
+
+            _ps.Play();
+
+            Debug.Log("[MetaScan-PointCloud] Visualizer created (max: " + maxPoints + " points)");
         }
 
         /// <summary>
-        /// Add a single point to the visualizer.
+        /// Add points representing a captured frame's coverage area.
         /// </summary>
-        /// <param name="worldPosition">World position of the point</param>
-        /// <param name="color">Color of the point (quality indicator)</param>
-        public void AddPoint(Vector3 worldPosition, Color color)
+        public void AddFramePoints(Vector3 cameraPos, Vector3 forward,
+            Vector3 right, Vector3 up, bool qualityOk, float hitDistance)
         {
-            if (currentPointCount >= maxPoints)
-            {
-                Debug.LogWarning("[Meta3D-PointCloud] Max points reached, ignoring new points");
-                return;
-            }
+            if (_ps == null || currentPointCount >= maxPoints) return;
 
-            pointPositions.Add(worldPosition);
-            pointColors.Add(color);
+            Color pointColor = qualityOk ? goodColor : poorColor;
+            float dist = hitDistance > 0.1f ? hitDistance : 1.0f;
+
+            int pointsToAdd = Mathf.Min(pointsPerFrame, maxPoints - currentPointCount);
+
+            for (int i = 0; i < pointsToAdd; i++)
+            {
+                // Generate point in a cone from camera towards forward direction
+                float offsetX = Random.Range(-pointSpread, pointSpread);
+                float offsetY = Random.Range(-pointSpread, pointSpread);
+                float offsetZ = Random.Range(-0.1f, 0.1f);
+
+                Vector3 pos = cameraPos
+                    + forward * dist
+                    + right * offsetX
+                    + up * offsetY;
+
+                // Add some noise
+                pos += new Vector3(
+                    Random.Range(-pointNoise, pointNoise),
+                    Random.Range(-pointNoise, pointNoise),
+                    Random.Range(-pointNoise, pointNoise)
+                );
+
+                // If we have a selection, only add points within it
+                if (objectSelector != null && objectSelector.HasSelection)
+                {
+                    if (!objectSelector.IsPointInSelection(pos))
+                        continue;
+                }
+
+                EmitPoint(pos, pointColor);
+            }
+        }
+
+        /// <summary>
+        /// Add a single point at a specific position.
+        /// </summary>
+        public void AddPoint(Vector3 position, Color color)
+        {
+            EmitPoint(position, color);
+        }
+
+        private void EmitPoint(Vector3 position, Color color)
+        {
+            if (currentPointCount >= maxPoints) return;
+
+            var emitParams = new ParticleSystem.EmitParams();
+            emitParams.position = position;
+            emitParams.velocity = Vector3.zero;
+            emitParams.startLifetime = float.MaxValue;
+            emitParams.startSize = pointSize;
+            emitParams.startColor = color;
+
+            _ps.Emit(emitParams, 1);
             currentPointCount++;
-
-            // Track quality stats based on color
-            if (IsColorClose(color, goodQualityColor))
-                goodQualityCount++;
-            else if (IsColorClose(color, mediumQualityColor))
-                mediumQualityCount++;
-            else if (IsColorClose(color, lowQualityColor))
-                lowQualityCount++;
-
-            // Update particles
-            UpdateParticles();
         }
 
         /// <summary>
-        /// Add multiple points at once (batch operation, more efficient).
-        /// </summary>
-        /// <param name="positions">Array of world positions</param>
-        /// <param name="color">Color for all points in this batch</param>
-        public void AddPoints(Vector3[] positions, Color color)
-        {
-            foreach (Vector3 pos in positions)
-            {
-                if (currentPointCount >= maxPoints) break;
-
-                pointPositions.Add(pos);
-                pointColors.Add(color);
-                currentPointCount++;
-            }
-
-            UpdateParticles();
-        }
-
-        /// <summary>
-        /// Add points based on a camera frame capture.
-        /// Generates points along the camera's forward direction at varying depths.
-        /// </summary>
-        /// <param name="cameraPosition">Camera world position</param>
-        /// <param name="cameraForward">Camera forward direction</param>
-        /// <param name="cameraRight">Camera right direction</param>
-        /// <param name="cameraUp">Camera up direction</param>
-        /// <param name="qualityOk">Whether the frame quality is acceptable</param>
-        /// <param name="hitDistance">Distance to the surface (if known, 0 = estimate)</param>
-        public void AddFramePoints(Vector3 cameraPosition, Vector3 cameraForward,
-            Vector3 cameraRight, Vector3 cameraUp, bool qualityOk, float hitDistance = 0f)
-        {
-            Color pointColor = qualityOk ? goodQualityColor : lowQualityColor;
-            float distance = hitDistance > 0f ? hitDistance : 1.5f; // Default 1.5m if unknown
-
-            // Generate a small cluster of points at the estimated surface position
-            int pointsPerFrame = 5;
-            for (int i = 0; i < pointsPerFrame; i++)
-            {
-                if (currentPointCount >= maxPoints) break;
-
-                // Random offset within headCaptureRadius
-                float offsetX = Random.Range(-headCaptureRadius, headCaptureRadius);
-                float offsetY = Random.Range(-headCaptureRadius, headCaptureRadius);
-
-                Vector3 surfacePoint = cameraPosition
-                    + cameraForward * distance
-                    + cameraRight * offsetX
-                    + cameraUp * offsetY;
-
-                pointPositions.Add(surfacePoint);
-                pointColors.Add(pointColor);
-                currentPointCount++;
-
-                if (qualityOk) goodQualityCount++;
-                else lowQualityCount++;
-            }
-
-            UpdateParticles();
-        }
-
-        /// <summary>
-        /// Clear all points from the visualizer.
+        /// Clear all points.
         /// </summary>
         public void ClearPoints()
         {
-            pointPositions.Clear();
-            pointColors.Clear();
-            currentPointCount = 0;
-            goodQualityCount = 0;
-            mediumQualityCount = 0;
-            lowQualityCount = 0;
-
-            if (particleSys != null)
+            if (_ps != null)
             {
-                particleSys.Clear();
+                _ps.Clear();
+                currentPointCount = 0;
             }
-
-            Debug.Log("[Meta3D-PointCloud] Point cloud cleared");
-        }
-
-        private void UpdateParticles()
-        {
-            if (particleSys == null || currentPointCount == 0) return;
-
-            // Ensure particle system is playing
-            if (!particleSys.isPlaying)
-            {
-                particleSys.Play();
-            }
-
-            // Set all particles
-            int count = Mathf.Min(currentPointCount, maxPoints);
-
-            for (int i = 0; i < count; i++)
-            {
-                particles[i].position = pointPositions[i];
-                particles[i].startColor = pointColors[i];
-                particles[i].startSize = pointSize;
-                particles[i].remainingLifetime = float.MaxValue;
-                particles[i].startLifetime = float.MaxValue;
-            }
-
-            particleSys.SetParticles(particles, count);
         }
 
         /// <summary>
-        /// Set the quality color for a specific point index.
+        /// Get current point count.
         /// </summary>
-        public void SetPointQuality(int index, bool isGood)
+        public int GetPointCount()
         {
-            if (index < 0 || index >= currentPointCount) return;
-
-            pointColors[index] = isGood ? goodQualityColor : lowQualityColor;
-            UpdateParticles();
-        }
-
-        /// <summary>
-        /// Get the quality percentage (good quality points / total points).
-        /// </summary>
-        public float GetQualityPercent()
-        {
-            if (currentPointCount == 0) return 0f;
-            return (float)goodQualityCount / currentPointCount * 100f;
-        }
-
-        private bool IsColorClose(Color a, Color b)
-        {
-            float threshold = 0.3f;
-            return Mathf.Abs(a.r - b.r) < threshold &&
-                   Mathf.Abs(a.g - b.g) < threshold &&
-                   Mathf.Abs(a.b - b.b) < threshold;
-        }
-
-        /// <summary>
-        /// Set the point size.
-        /// </summary>
-        public void SetPointSize(float size)
-        {
-            pointSize = size;
-            if (currentPointCount > 0)
-            {
-                UpdateParticles();
-            }
-        }
-
-        private void OnDestroy()
-        {
-            pointPositions.Clear();
-            pointColors.Clear();
+            return currentPointCount;
         }
     }
 }

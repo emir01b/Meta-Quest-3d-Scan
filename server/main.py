@@ -1,5 +1,5 @@
 """
-Meta3D Scanner - Main Server
+MetaScan — Main Server
 FastAPI + WebSocket server that receives data from Quest 3S
 and orchestrates 3D reconstruction.
 """
@@ -13,12 +13,12 @@ from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from config import (
     SERVER_HOST, SERVER_PORT, SESSIONS_DIR, EXPORTS_DIR,
-    SessionInfo, MIN_FRAMES_FOR_RECONSTRUCTION
+    MIN_FRAMES_FOR_RECONSTRUCTION
 )
 from frame_handler import FrameHandler
 from reconstruction import ReconstructionPipeline, SimpleReconstruction
@@ -27,9 +27,9 @@ from reconstruction import ReconstructionPipeline, SimpleReconstruction
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-    datefmt="%H:%M:%S"
+    datefmt="%H:%M:%S",
 )
-logger = logging.getLogger("meta3d.server")
+logger = logging.getLogger("metascan.server")
 
 # Active sessions
 active_sessions: dict[str, dict] = {}
@@ -40,22 +40,21 @@ reconstruction_tasks: dict[str, asyncio.Task] = {}
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
     logger.info("=" * 60)
-    logger.info("  Meta3D Scanner Server Starting")
+    logger.info("  MetaScan Server Starting")
     logger.info(f"  WebSocket: ws://{SERVER_HOST}:{SERVER_PORT}/ws/scan")
     logger.info(f"  API: http://{SERVER_HOST}:{SERVER_PORT}/api")
     logger.info(f"  Viewer: http://{SERVER_HOST}:{SERVER_PORT}/viewer")
     logger.info("=" * 60)
     yield
-    # Cleanup
     for task in reconstruction_tasks.values():
         task.cancel()
     logger.info("Server shutting down")
 
 
 app = FastAPI(
-    title="Meta3D Scanner Server",
+    title="MetaScan Server",
     description="3D object scanning and reconstruction from Meta Quest 3S",
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -74,9 +73,8 @@ if viewer_dir.exists():
     app.mount("/viewer", StaticFiles(directory=str(viewer_dir), html=True), name="viewer")
 
 # Serve exported models
-exports_dir = EXPORTS_DIR
-if exports_dir.exists():
-    app.mount("/exports", StaticFiles(directory=str(exports_dir)), name="exports")
+if EXPORTS_DIR.exists():
+    app.mount("/exports", StaticFiles(directory=str(EXPORTS_DIR)), name="exports")
 
 
 # =============================================================================
@@ -86,7 +84,7 @@ if exports_dir.exists():
 @app.get("/api/health")
 async def health_check():
     """Health check endpoint."""
-    return {"status": "ok", "timestamp": time.time()}
+    return {"status": "ok", "version": "2.0.0", "timestamp": time.time()}
 
 
 @app.get("/api/sessions")
@@ -94,38 +92,29 @@ async def list_sessions():
     """List all scanning sessions."""
     sessions = []
     if SESSIONS_DIR.exists():
-        for session_dir in sorted(SESSIONS_DIR.iterdir()):
-            if session_dir.is_dir():
-                meta_file = session_dir / "session_metadata.json"
-                if meta_file.exists():
-                    with open(meta_file) as f:
-                        meta = json.load(f)
-                    sessions.append({
-                        "session_id": session_dir.name,
-                        "frame_count": meta.get("total_frames", 0),
-                        "timestamp": meta.get("timestamp", 0),
-                    })
-                else:
-                    # Count images
-                    images = list((session_dir / "images").glob("*")) if (session_dir / "images").exists() else []
-                    sessions.append({
-                        "session_id": session_dir.name,
-                        "frame_count": len(images),
-                    })
+        for session_dir in sorted(SESSIONS_DIR.iterdir(), reverse=True):
+            if not session_dir.is_dir():
+                continue
+            meta_file = session_dir / "session_metadata.json"
+            if meta_file.exists():
+                with open(meta_file) as f:
+                    meta = json.load(f)
+                sessions.append({
+                    "session_id": session_dir.name,
+                    "frame_count": meta.get("total_frames", 0),
+                    "timestamp": meta.get("timestamp", 0),
+                    "duration": meta.get("duration_seconds", 0),
+                })
+            else:
+                images_dir = session_dir / "images"
+                image_count = 0
+                if images_dir.exists():
+                    image_count = len(list(images_dir.glob("*.jpg")))
+                sessions.append({
+                    "session_id": session_dir.name,
+                    "frame_count": image_count,
+                })
     return {"sessions": sessions}
-
-
-@app.post("/api/sessions/create")
-async def create_session(name: str = "scan"):
-    """Create a new scanning session."""
-    session_id = f"{name}_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
-    handler = FrameHandler(session_id)
-    active_sessions[session_id] = {
-        "handler": handler,
-        "created_at": time.time(),
-        "status": "ready",
-    }
-    return {"session_id": session_id, "status": "created"}
 
 
 @app.get("/api/sessions/{session_id}")
@@ -140,15 +129,18 @@ async def get_session(session_id: str):
         with open(meta_file) as f:
             return json.load(f)
 
-    images = list((session_dir / "images").glob("*")) if (session_dir / "images").exists() else []
-    return {"session_id": session_id, "frame_count": len(images)}
+    images_dir = session_dir / "images"
+    image_count = 0
+    if images_dir.exists():
+        image_count = len(list(images_dir.glob("*.jpg")))
+    return {"session_id": session_id, "frame_count": image_count}
 
 
 @app.post("/api/sessions/{session_id}/reconstruct")
 async def start_reconstruction(session_id: str, method: str = "full"):
     """
     Start 3D reconstruction for a session.
-    method: 'colmap', 'nerfstudio', 'full' (both), or 'tsdf' (depth-only fallback)
+    method: 'colmap', 'full' (both), or 'tsdf' (depth-only fallback)
     """
     session_dir = SESSIONS_DIR / session_id
     if not session_dir.exists():
@@ -159,7 +151,6 @@ async def start_reconstruction(session_id: str, method: str = "full"):
         if not task.done():
             return {"status": "already_running", "session_id": session_id}
 
-    # Start reconstruction in background
     async def run_reconstruction():
         loop = asyncio.get_event_loop()
         pipeline = ReconstructionPipeline(session_dir, session_id)
@@ -167,22 +158,21 @@ async def start_reconstruction(session_id: str, method: str = "full"):
         if method == "tsdf":
             result = await loop.run_in_executor(
                 None, SimpleReconstruction.reconstruct_from_depth_maps,
-                session_dir, session_id
+                session_dir, session_id,
             )
         elif method == "colmap":
             result = await loop.run_in_executor(
-                None, pipeline.run_colmap_pipeline, True
-            )
-        elif method == "nerfstudio":
-            result = await loop.run_in_executor(
-                None, pipeline.run_nerfstudio_pipeline
+                None, pipeline.run_colmap_pipeline, True,
             )
         else:  # full
             result = await loop.run_in_executor(
-                None, pipeline.run_full_pipeline, True
+                None, pipeline.run_full_pipeline, True,
             )
 
-        logger.info(f"Reconstruction complete for {session_id}: {result.get('status', 'unknown')}")
+        logger.info(
+            f"Reconstruction complete for {session_id}: "
+            f"{result.get('status', 'unknown')}"
+        )
         return result
 
     task = asyncio.create_task(run_reconstruction())
@@ -220,6 +210,7 @@ async def list_exports(session_id: str):
         if f.is_file():
             exports.append({
                 "filename": f.name,
+                "format": f.suffix.lstrip(".").upper(),
                 "size_mb": round(f.stat().st_size / (1024 * 1024), 2),
                 "url": f"/exports/{session_id}/{f.name}",
             })
@@ -227,21 +218,21 @@ async def list_exports(session_id: str):
 
 
 # =============================================================================
-# WebSocket - Real-time Frame Streaming
+# WebSocket — Real-time Frame Streaming
 # =============================================================================
 
 @app.websocket("/ws/scan")
 async def websocket_scan(websocket: WebSocket):
     """
     WebSocket endpoint for real-time frame streaming from Quest 3S.
-    
+
     Protocol:
     1. Client sends JSON: {"action": "start_session", "name": "my_scan"}
     2. Server responds: {"action": "session_started", "session_id": "..."}
-    3. Client sends binary frames (see FrameHandler.process_frame for format)
-    4. Server responds with quality feedback for each frame
+    3. Client sends binary frames (see FrameHandler for format)
+    4. Server responds with quality feedback per frame
     5. Client sends JSON: {"action": "stop_session"}
-    6. Server responds and starts reconstruction
+    6. Server finalizes and optionally starts reconstruction
     """
     await websocket.accept()
     logger.info("Quest client connected")
@@ -254,13 +245,16 @@ async def websocket_scan(websocket: WebSocket):
             data = await websocket.receive()
 
             if "text" in data:
-                # JSON control message
                 msg = json.loads(data["text"])
                 action = msg.get("action")
 
                 if action == "start_session":
                     session_name = msg.get("name", "scan")
-                    session_id = f"{session_name}_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+                    session_id = (
+                        f"{session_name}_"
+                        f"{time.strftime('%Y%m%d_%H%M%S')}_"
+                        f"{uuid.uuid4().hex[:6]}"
+                    )
                     handler = FrameHandler(session_id)
                     active_sessions[session_id] = {
                         "handler": handler,
@@ -277,16 +271,20 @@ async def websocket_scan(websocket: WebSocket):
                     if handler:
                         handler.save_session_metadata()
                         handler.prepare_colmap_input()
-                        frame_count = handler.frame_count
+                        frame_count = handler.accepted_frames
 
                         active_sessions[session_id]["status"] = "captured"
                         await websocket.send_json({
                             "action": "session_stopped",
                             "session_id": session_id,
                             "total_frames": frame_count,
-                            "ready_for_reconstruction": frame_count >= MIN_FRAMES_FOR_RECONSTRUCTION,
+                            "ready_for_reconstruction": (
+                                frame_count >= MIN_FRAMES_FOR_RECONSTRUCTION
+                            ),
                         })
-                        logger.info(f"Session stopped: {session_id} ({frame_count} frames)")
+                        logger.info(
+                            f"Session stopped: {session_id} ({frame_count} frames)"
+                        )
                     else:
                         await websocket.send_json({
                             "action": "error",
@@ -301,14 +299,11 @@ async def websocket_scan(websocket: WebSocket):
                             "session_id": session_id,
                             "method": method,
                         })
-                        # Reconstruction runs in background via REST API
-                        # Client can poll /api/sessions/{id}/reconstruction/status
 
                 elif action == "ping":
                     await websocket.send_json({"action": "pong"})
 
             elif "bytes" in data:
-                # Binary frame data
                 if handler is None:
                     await websocket.send_json({
                         "action": "error",

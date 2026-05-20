@@ -3,10 +3,12 @@
  * Visible laser pointer from right controller for interacting with World Space UI.
  * Uses Physics.Raycast + manual button click invocation — no OVR UI dependencies.
  * Shows laser only when UI panel is visible.
+ * Opens Meta Quest System Keyboard Overlay for InputField interaction.
  */
 
 using UnityEngine;
 using UnityEngine.UI;
+using UnityEngine.EventSystems;
 
 namespace MetaScan
 {
@@ -30,8 +32,13 @@ namespace MetaScan
 
         // Interaction state
         private Button hoveredButton;
+        private InputField hoveredInputField;
         private Image hoveredImage;
         private Color originalButtonColor;
+
+        // System keyboard state
+        private TouchScreenKeyboard activeKeyboard;
+        private InputField activeKeyboardField;
 
         private void Start()
         {
@@ -75,6 +82,9 @@ namespace MetaScan
 
         private void Update()
         {
+            // Always sync system keyboard text back to the InputField
+            SyncKeyboardText();
+
             // Only show laser when UI panel is visible
             bool panelVisible = handUIManager != null
                 && handUIManager.UICanvas != null
@@ -84,7 +94,7 @@ namespace MetaScan
 
             if (!panelVisible)
             {
-                if (hoveredButton != null) ClearHover();
+                if (hoveredButton != null || hoveredInputField != null) ClearHover();
                 if (hitDot != null) hitDot.SetActive(false);
                 return;
             }
@@ -109,19 +119,22 @@ namespace MetaScan
                 if (canvas != null)
                 {
                     Button btn = FindButtonAtWorldPoint(canvas, hit.point);
-                    UpdateHover(btn);
-                    HandleTrigger(btn);
+                    InputField inputField = btn == null ? FindInputFieldAtWorldPoint(canvas, hit.point) : null;
+
+                    UpdateHover(btn, inputField);
+                    HandleTrigger(btn, inputField);
 
                     // Change laser color on hover
-                    Color c = btn != null ? hoverColor : laserColor;
+                    bool hasHover = (btn != null || inputField != null);
+                    Color c = hasHover ? hoverColor : laserColor;
                     laserLine.startColor = c;
                     laserLine.endColor = c * 0.3f;
                     if (hitDotRenderer != null)
-                        hitDotRenderer.material.color = btn != null ? hoverColor : Color.white;
+                        hitDotRenderer.material.color = hasHover ? hoverColor : Color.white;
                 }
                 else
                 {
-                    UpdateHover(null);
+                    UpdateHover(null, null);
                     ResetLaserColor();
                 }
             }
@@ -131,14 +144,49 @@ namespace MetaScan
                 laserLine.SetPosition(0, ray.origin);
                 laserLine.SetPosition(1, ray.origin + ray.direction * maxDistance);
                 hitDot.SetActive(false);
-                UpdateHover(null);
+                UpdateHover(null, null);
                 ResetLaserColor();
             }
         }
 
+        // =========================================================
+        // System Keyboard Sync (runs every frame in Update)
+        // =========================================================
+
+        private void SyncKeyboardText()
+        {
+            if (activeKeyboard == null || activeKeyboardField == null) return;
+
+            // While visible, continuously sync text from keyboard to InputField
+            if (activeKeyboard.status == TouchScreenKeyboard.Status.Visible)
+            {
+                activeKeyboardField.text = activeKeyboard.text;
+            }
+            else if (activeKeyboard.status == TouchScreenKeyboard.Status.Done)
+            {
+                // User pressed Done — final sync
+                activeKeyboardField.text = activeKeyboard.text;
+                activeKeyboardField.DeactivateInputField();
+                Debug.Log("[MetaScan-Pointer] Keyboard done. Text: " + activeKeyboard.text);
+                activeKeyboard = null;
+                activeKeyboardField = null;
+            }
+            else if (activeKeyboard.status == TouchScreenKeyboard.Status.Canceled ||
+                     activeKeyboard.status == TouchScreenKeyboard.Status.LostFocus)
+            {
+                // User cancelled or keyboard lost focus
+                activeKeyboardField.DeactivateInputField();
+                activeKeyboard = null;
+                activeKeyboardField = null;
+            }
+        }
+
+        // =========================================================
+        // Hit Detection
+        // =========================================================
+
         private Button FindButtonAtWorldPoint(Canvas canvas, Vector3 worldPoint)
         {
-            // Get all buttons in the canvas
             Button[] buttons = canvas.GetComponentsInChildren<Button>(false);
 
             foreach (Button btn in buttons)
@@ -146,11 +194,7 @@ namespace MetaScan
                 if (!btn.gameObject.activeInHierarchy || !btn.interactable) continue;
 
                 RectTransform btnRect = btn.GetComponent<RectTransform>();
-
-                // Convert world point to button's local space
                 Vector3 btnLocal = btnRect.InverseTransformPoint(worldPoint);
-
-                // Check if point is within button bounds
                 Rect rect = btnRect.rect;
                 if (rect.Contains(new Vector2(btnLocal.x, btnLocal.y)))
                 {
@@ -160,14 +204,35 @@ namespace MetaScan
             return null;
         }
 
-        private void UpdateHover(Button newBtn)
+        private InputField FindInputFieldAtWorldPoint(Canvas canvas, Vector3 worldPoint)
         {
-            if (newBtn == hoveredButton) return;
+            InputField[] fields = canvas.GetComponentsInChildren<InputField>(false);
 
-            // Clear old hover
-            if (hoveredButton != null) ClearHover();
+            foreach (InputField field in fields)
+            {
+                if (!field.gameObject.activeInHierarchy || !field.interactable) continue;
 
-            // Set new hover
+                RectTransform fieldRect = field.GetComponent<RectTransform>();
+                Vector3 fieldLocal = fieldRect.InverseTransformPoint(worldPoint);
+                Rect rect = fieldRect.rect;
+                if (rect.Contains(new Vector2(fieldLocal.x, fieldLocal.y)))
+                {
+                    return field;
+                }
+            }
+            return null;
+        }
+
+        // =========================================================
+        // Hover Management
+        // =========================================================
+
+        private void UpdateHover(Button newBtn, InputField newField)
+        {
+            if (newBtn == hoveredButton && newField == hoveredInputField) return;
+
+            ClearHover();
+
             if (newBtn != null)
             {
                 hoveredButton = newBtn;
@@ -177,8 +242,18 @@ namespace MetaScan
                     originalButtonColor = hoveredImage.color;
                     hoveredImage.color = originalButtonColor * 1.3f;
                 }
-
-                // Haptic feedback on hover
+                if (controllerManager != null)
+                    controllerManager.SendHaptic(false, 0.1f, 0.15f, 0.03f);
+            }
+            else if (newField != null)
+            {
+                hoveredInputField = newField;
+                hoveredImage = newField.GetComponent<Image>();
+                if (hoveredImage != null)
+                {
+                    originalButtonColor = hoveredImage.color;
+                    hoveredImage.color = originalButtonColor * 1.3f;
+                }
                 if (controllerManager != null)
                     controllerManager.SendHaptic(false, 0.1f, 0.15f, 0.03f);
             }
@@ -191,13 +266,16 @@ namespace MetaScan
                 hoveredImage.color = originalButtonColor;
             }
             hoveredButton = null;
+            hoveredInputField = null;
             hoveredImage = null;
         }
 
-        private void HandleTrigger(Button btn)
-        {
-            if (btn == null) return;
+        // =========================================================
+        // Trigger / Click Handling
+        // =========================================================
 
+        private void HandleTrigger(Button btn, InputField field)
+        {
             bool triggerDown = false;
 #if META_XR_SDK
             triggerDown = OVRInput.GetDown(OVRInput.Button.PrimaryIndexTrigger, OVRInput.Controller.RTouch);
@@ -207,28 +285,60 @@ namespace MetaScan
 
             if (triggerDown)
             {
-                // Invoke button click
-                btn.onClick.Invoke();
-
-                // Visual flash feedback
-                if (hoveredImage != null)
+                if (btn != null)
                 {
-                    StartCoroutine(FlashButton(hoveredImage, originalButtonColor));
+                    btn.onClick.Invoke();
+
+                    if (hoveredImage != null)
+                    {
+                        StartCoroutine(FlashButton(hoveredImage, originalButtonColor));
+                    }
+
+                    if (controllerManager != null)
+                        controllerManager.SendHaptic(false, 0.5f, 0.5f, 0.1f);
+
+                    Debug.Log("[MetaScan-Pointer] Button clicked: " + btn.gameObject.name);
                 }
+                else if (field != null)
+                {
+                    // Open Meta Quest System Keyboard Overlay
+                    // Requires OVRManager.requiresSystemKeyboard = true (set in MRSetup.cs)
+                    // and "oculus.software.overlay_keyboard" in AndroidManifest.xml
+                    string currentText = field.text ?? "";
 
-                // Haptic click feedback
-                if (controllerManager != null)
-                    controllerManager.SendHaptic(false, 0.5f, 0.5f, 0.1f);
+                    activeKeyboard = TouchScreenKeyboard.Open(
+                        currentText,
+                        TouchScreenKeyboardType.Default,
+                        false,  // autocorrection
+                        false,  // multiline
+                        false,  // secure
+                        false,  // alert
+                        ""      // placeholder
+                    );
+                    activeKeyboardField = field;
 
-                Debug.Log("[MetaScan-Pointer] Button clicked: " + btn.gameObject.name);
+                    Debug.Log("[MetaScan-Pointer] System keyboard opened for: " + field.gameObject.name);
+
+                    if (hoveredImage != null)
+                    {
+                        StartCoroutine(FlashButton(hoveredImage, originalButtonColor));
+                    }
+
+                    if (controllerManager != null)
+                        controllerManager.SendHaptic(false, 0.5f, 0.5f, 0.1f);
+                }
             }
         }
+
+        // =========================================================
+        // Visual Helpers
+        // =========================================================
 
         private System.Collections.IEnumerator FlashButton(Image img, Color originalColor)
         {
             if (img != null) img.color = Color.white;
             yield return new WaitForSeconds(0.1f);
-            if (img != null) img.color = originalColor * 1.3f; // Stay in hover state
+            if (img != null) img.color = originalColor * 1.3f;
         }
 
         private void ResetLaserColor()

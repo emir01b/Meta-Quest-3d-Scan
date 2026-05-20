@@ -17,6 +17,10 @@ namespace MetaScan
         [Header("References")]
         [SerializeField] private ControllerManager controllerManager;
 
+        [Header("Default Connection Settings")]
+        [SerializeField] private string defaultIP = "192.168.1.100";
+        [SerializeField] private int defaultPort = 8765;
+
         [Header("UI Settings")]
         [SerializeField] private float canvasWidth = 0.32f;
         [SerializeField] private float canvasHeight = 0.26f;
@@ -156,13 +160,11 @@ namespace MetaScan
             scaler.dynamicPixelsPerUnit = 10;
             scaler.referencePixelsPerUnit = 100;
 
-#if META_XR_SDK
             // BoxCollider for VRUIPointer's Physics.Raycast to detect canvas hits
             BoxCollider canvasCollider = canvasObject.AddComponent<BoxCollider>();
             Vector2 canvasSize = canvasRect.sizeDelta;
             canvasCollider.size = new Vector3(canvasSize.x, canvasSize.y, 1f);
             canvasCollider.center = Vector3.zero;
-#endif
             canvasObject.AddComponent<GraphicRaycaster>();
 
             // Build UI sections
@@ -218,12 +220,35 @@ namespace MetaScan
                 new Vector2(pad + 12f, 46f), new Vector2(20f, 14f), TextAnchor.MiddleLeft);
 
             // IP Input
-            ipInputField = CreateInput(parent, "192.168.1.100",
+            string initialIP = PlayerPrefs.GetString("MetaScan_ServerIP", defaultIP);
+            string initialPort = PlayerPrefs.GetInt("MetaScan_ServerPort", defaultPort).ToString();
+
+            DataStreamer streamer = FindFirstObjectByType<DataStreamer>();
+            if (streamer != null)
+            {
+                if (PlayerPrefs.HasKey("MetaScan_ServerIP"))
+                {
+                    streamer.ServerIP = initialIP;
+                    if (int.TryParse(initialPort, out int parsedPort))
+                    {
+                        streamer.ServerPort = parsedPort;
+                    }
+                }
+                else
+                {
+                    initialIP = streamer.ServerIP;
+                    initialPort = streamer.ServerPort.ToString();
+                }
+            }
+
+            ipInputField = CreateInput(parent, initialIP,
                 new Vector2(pad + 32f, 44f), new Vector2(w - pad * 2 - 32f - 56f, 20f));
+            ipInputField.gameObject.name = "Input_IP";
 
             // Port Input
-            portInputField = CreateInput(parent, "8765",
+            portInputField = CreateInput(parent, initialPort,
                 new Vector2(w - pad - 52f, 44f), new Vector2(52f, 20f));
+            portInputField.gameObject.name = "Input_Port";
 
             // Connect button
             connectButton = CreateBtn(parent, "Baglan", accentColor,
@@ -474,6 +499,12 @@ namespace MetaScan
                 int.TryParse(portInputField.text, out port);
                 if (port <= 0 || port > 65535) port = 8765;
             }
+
+            // Save to PlayerPrefs so it is remembered on next launch
+            PlayerPrefs.SetString("MetaScan_ServerIP", ip);
+            PlayerPrefs.SetInt("MetaScan_ServerPort", port);
+            PlayerPrefs.Save();
+
             OnConnectRequested?.Invoke(ip, port);
         }
 

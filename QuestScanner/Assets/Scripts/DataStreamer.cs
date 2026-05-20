@@ -69,6 +69,18 @@ namespace MetaScan
         // Connection
         // =========================================================
 
+        public string ServerIP
+        {
+            get => serverIP;
+            set => serverIP = value;
+        }
+
+        public int ServerPort
+        {
+            get => serverPort;
+            set => serverPort = value;
+        }
+
         public void SetServerInfo(string ip, int port)
         {
             serverIP = ip;

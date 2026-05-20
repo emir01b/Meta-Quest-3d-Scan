@@ -1,12 +1,16 @@
 /*
  * MetaScan — Camera Capture
  * Captures passthrough camera images from Meta Quest 3S.
- * Uses #if META_XR_SDK for OVR Camera Access API.
- * Encodes frames as JPEG with quality metrics.
+ * Uses MRUK PassthroughCameraAccess for direct Passthrough capture.
+ * Falls back to WebCamTexture or RenderTexture.
  */
 
 using System;
 using UnityEngine;
+
+#if META_XR_SDK
+using Meta.XR;
+#endif
 
 namespace MetaScan
 {
@@ -17,9 +21,6 @@ namespace MetaScan
         [SerializeField] private int captureHeight = 960;
         [SerializeField] private int jpegQuality = 85;
         [SerializeField] private float captureInterval = 0.1f; // 10 fps default
-
-        [Header("Quality Settings")]
-        [SerializeField] private float blurThreshold = 100f;
 
         // State
         public bool IsCapturing { get; private set; }
@@ -38,6 +39,15 @@ namespace MetaScan
         private float focalLengthY = 640f;
         private float principalPointX = 640f;
         private float principalPointY = 480f;
+
+#if META_XR_SDK
+        // Official Meta Passthrough Camera Access API
+        private PassthroughCameraAccess mrukCameraAccess;
+#endif
+
+        // WebCamTexture fallback for real-world capture
+        private WebCamTexture webcamTexture;
+        private bool useWebCamCapture = false;
 
         // Render texture for screenshot fallback
         private RenderTexture captureRT;
@@ -58,9 +68,81 @@ namespace MetaScan
         {
             FindHeadTransform();
 
-            // Create capture texture
+            // Create capture texture for fallback
             captureRT = new RenderTexture(captureWidth, captureHeight, 24);
             captureTexture = new Texture2D(captureWidth, captureHeight, TextureFormat.RGB24, false);
+
+            StartCoroutine(InitializeCameraRoutine());
+        }
+
+        private System.Collections.IEnumerator InitializeCameraRoutine()
+        {
+#if UNITY_ANDROID && !UNITY_EDITOR
+            string camPermission = UnityEngine.Android.Permission.Camera;
+            
+            // Request permissions if not already granted
+            if (!UnityEngine.Android.Permission.HasUserAuthorizedPermission(camPermission))
+            {
+                UnityEngine.Android.Permission.RequestUserPermission(camPermission);
+                
+                // Wait until the user either grants or denies the permission
+                float timeout = Time.time + 30f; // 30 seconds timeout
+                while (!UnityEngine.Android.Permission.HasUserAuthorizedPermission(camPermission))
+                {
+                    if (Time.time > timeout)
+                    {
+                        Debug.LogWarning("[MetaScan-Camera] Permission request timed out.");
+                        yield break;
+                    }
+                    yield return null;
+                }
+            }
+
+            // Wait a little bit extra to ensure OS is ready
+            yield return new WaitForSeconds(0.5f);
+
+#if META_XR_SDK
+            // Try to initialize MRUK PassthroughCameraAccess
+            mrukCameraAccess = FindFirstObjectByType<PassthroughCameraAccess>();
+            if (mrukCameraAccess == null)
+            {
+                Debug.Log("[MetaScan-Camera] PassthroughCameraAccess not found in scene. Creating one...");
+                mrukCameraAccess = gameObject.AddComponent<PassthroughCameraAccess>();
+                yield return new WaitForSeconds(0.5f); // Wait for initialization
+            }
+
+            if (mrukCameraAccess != null)
+            {
+                Debug.Log("[MetaScan-Camera] Official MRUK PassthroughCameraAccess enabled.");
+            }
+#endif
+
+            // Fallback: WebCamTexture
+            if (WebCamTexture.devices.Length > 0)
+            {
+                webcamTexture = new WebCamTexture(WebCamTexture.devices[0].name, captureWidth, captureHeight, 30);
+                
+                // Force WebCamTexture to update by applying it to a dummy renderer
+                GameObject dummyObj = GameObject.CreatePrimitive(PrimitiveType.Quad);
+                dummyObj.name = "WebCamDummyRenderer";
+                dummyObj.transform.SetParent(this.transform);
+                // Hide it behind the camera or make it very small/disabled visual but active object
+                dummyObj.transform.localPosition = new Vector3(0, -1000, 0); 
+                dummyObj.transform.localScale = Vector3.zero;
+                MeshRenderer renderer = dummyObj.GetComponent<MeshRenderer>();
+                renderer.material.mainTexture = webcamTexture;
+
+                webcamTexture.Play();
+                useWebCamCapture = true;
+                Debug.Log("[MetaScan-Camera] WebCamTexture fallback initialized on: " + WebCamTexture.devices[0].name);
+            }
+            else
+            {
+                Debug.LogWarning("[MetaScan-Camera] No WebCam devices found.");
+            }
+#else
+            yield return null;
+#endif
         }
 
         private void FindHeadTransform()
@@ -82,12 +164,22 @@ namespace MetaScan
             IsCapturing = true;
             FrameIndex = 0;
             nextCaptureTime = 0f;
-            Debug.Log("[MetaScan-Camera] Capture started");
+
+            if (useWebCamCapture && webcamTexture != null && !webcamTexture.isPlaying)
+            {
+                webcamTexture.Play();
+            }
+
+            Debug.Log("[MetaScan-Camera] Capture started.");
         }
 
         public void StopCapturing()
         {
             IsCapturing = false;
+            if (useWebCamCapture && webcamTexture != null)
+            {
+                webcamTexture.Stop();
+            }
             Debug.Log($"[MetaScan-Camera] Capture stopped. Total frames: {FrameIndex}");
         }
 
@@ -134,15 +226,44 @@ namespace MetaScan
         private byte[] CaptureImage()
         {
 #if META_XR_SDK
-            // Try OVR Passthrough Camera API first
-            // NOTE: Requires Meta XR Camera Access package
-            // The Passthrough Camera API provides camera frames via
-            // OVRPlugin.Media.GetMrcFrameImageData or
-            // PassthroughCameraUtils (Meta-specific)
-            // For now, fall through to screenshot-based capture
+            // 1. Try Official MRUK Passthrough Camera Access API (Meta Quest 3/3S V74+)
+            if (mrukCameraAccess != null)
+            {
+                Texture ptTexture = mrukCameraAccess.GetTexture();
+                if (ptTexture != null && ptTexture.width > 16)
+                {
+                    // Copy to avoid modifying the original buffer directly and support encoding
+                    Texture2D texCopy = new Texture2D(ptTexture.width, ptTexture.height, TextureFormat.RGB24, false);
+                    
+                    // Safely convert any Texture to Texture2D using a temporary RenderTexture
+                    RenderTexture prevRT2 = RenderTexture.active;
+                    RenderTexture tempRT = RenderTexture.GetTemporary(ptTexture.width, ptTexture.height, 0, RenderTextureFormat.Default, RenderTextureReadWrite.Default);
+                    Graphics.Blit(ptTexture, tempRT);
+                    RenderTexture.active = tempRT;
+                    texCopy.ReadPixels(new Rect(0, 0, tempRT.width, tempRT.height), 0, 0);
+                    texCopy.Apply();
+                    RenderTexture.active = prevRT2;
+                    RenderTexture.ReleaseTemporary(tempRT);
+
+                    byte[] data = texCopy.EncodeToJPG(jpegQuality);
+                    Destroy(texCopy);
+                    return data;
+                }
+            }
 #endif
 
-            // Fallback: capture screen via RenderTexture
+            // 2. Try WebCamTexture API (Fallback for standard Android or earlier SDK)
+            if (useWebCamCapture && webcamTexture != null && webcamTexture.isPlaying && webcamTexture.width > 16)
+            {
+                Texture2D tempTex = new Texture2D(webcamTexture.width, webcamTexture.height, TextureFormat.RGB24, false);
+                tempTex.SetPixels(webcamTexture.GetPixels());
+                tempTex.Apply();
+                byte[] jpegData = tempTex.EncodeToJPG(jpegQuality);
+                Destroy(tempTex);
+                return jpegData;
+            }
+
+            // 3. Fallback: capture screen via RenderTexture (Unity UI + Camera Render - NO REAL WORLD)
             Camera cam = headTransform != null
                 ? headTransform.GetComponent<Camera>()
                 : Camera.main;
@@ -160,8 +281,7 @@ namespace MetaScan
             captureTexture.Apply();
             RenderTexture.active = prevActive;
 
-            byte[] jpegData = captureTexture.EncodeToJPG(jpegQuality);
-            return jpegData;
+            return captureTexture.EncodeToJPG(jpegQuality);
         }
 
         private double GetTimestamp()

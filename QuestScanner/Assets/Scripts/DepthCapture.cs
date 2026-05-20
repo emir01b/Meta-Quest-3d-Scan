@@ -13,7 +13,6 @@ namespace MetaScan
     {
         [Header("Depth Settings")]
         [SerializeField] private bool enableDepthCapture = true;
-        [SerializeField] private float maxDepth = 5.0f; // meters
 
         // State
         public bool IsDepthAvailable { get; private set; }

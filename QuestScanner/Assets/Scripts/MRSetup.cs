@@ -31,6 +31,13 @@ namespace MetaScan
 
             ovrManager.isInsightPassthroughEnabled = enablePassthrough;
 
+            // Enable camera access if supported by SDK version
+#if META_XR_SDK
+            // Note: In newer SDKs this might be property of OVRManager or OVRProjectConfig
+            // We set it in Project Config, but some SDK versions allow runtime toggle
+            // ovrManager.isPassthroughCameraAccessEnabled = true; 
+#endif
+
             // Add passthrough layer (SDK handles layering automatically)
             OVRPassthroughLayer passthroughLayer = ovrManager.GetComponent<OVRPassthroughLayer>();
             if (passthroughLayer == null)

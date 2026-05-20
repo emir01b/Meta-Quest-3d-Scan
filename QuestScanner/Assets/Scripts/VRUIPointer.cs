@@ -157,14 +157,11 @@ namespace MetaScan
         {
             if (activeKeyboard == null || activeKeyboardField == null) return;
 
-            // While visible, continuously sync text from keyboard to InputField
-            if (activeKeyboard.status == TouchScreenKeyboard.Status.Visible)
+            // Her karede anlık harf harf eşitleme yap
+            activeKeyboardField.text = activeKeyboard.text;
+
+            if (activeKeyboard.status == TouchScreenKeyboard.Status.Done)
             {
-                activeKeyboardField.text = activeKeyboard.text;
-            }
-            else if (activeKeyboard.status == TouchScreenKeyboard.Status.Done)
-            {
-                // User pressed Done — final sync
                 activeKeyboardField.text = activeKeyboard.text;
                 activeKeyboardField.DeactivateInputField();
                 Debug.Log("[MetaScan-Pointer] Keyboard done. Text: " + activeKeyboard.text);
@@ -174,7 +171,6 @@ namespace MetaScan
             else if (activeKeyboard.status == TouchScreenKeyboard.Status.Canceled ||
                      activeKeyboard.status == TouchScreenKeyboard.Status.LostFocus)
             {
-                // User cancelled or keyboard lost focus
                 activeKeyboardField.DeactivateInputField();
                 activeKeyboard = null;
                 activeKeyboardField = null;

@@ -34,6 +34,7 @@ namespace MetaScan
         private LineRenderer[] ringRenderers;
         private bool isDragging;
         private Vector3 dragStartPoint;
+        private float currentSelectionDistance = 0.8f;
 
         // Events
         public event Action<Vector3, float> OnObjectSelected;
@@ -58,13 +59,30 @@ namespace MetaScan
             IsSelecting = true;
             HasSelection = false;
             isDragging = false;
-            SetVisualsActive(false);
+
+            currentSelectionDistance = 0.8f;
+            SelectionRadius = 0.15f; // Varsayılan 15cm önizleme boyutu
 
             if (controllerManager != null)
             {
                 controllerManager.OnRightTriggerDown += OnTriggerDown;
                 controllerManager.OnRightTriggerUp += OnTriggerUp;
+
+                Ray ray = controllerManager.GetControllerRay(false);
+                SelectionCenter = ray.origin + ray.direction * currentSelectionDistance;
             }
+            else
+            {
+                Camera cam = Camera.main;
+                if (cam != null)
+                    SelectionCenter = cam.transform.position + cam.transform.forward * currentSelectionDistance;
+                else
+                    SelectionCenter = Vector3.forward * currentSelectionDistance;
+            }
+
+            SetVisualsActive(true); // Seçime tıklar tıklamaz küre belirmeli
+            UpdateVisualTransform();
+            UpdateVisualColor(selectionColor);
 
             Debug.Log("[MetaScan-Selector] Selection mode activated");
         }
@@ -100,20 +118,9 @@ namespace MetaScan
         {
             if (!IsSelecting) return;
 
-            // Use scan pointer's hit point or controller forward position
-            if (scanPointer != null && scanPointer.HasHit)
-            {
-                dragStartPoint = scanPointer.HitPoint;
-            }
-            else
-            {
-                // Default: 1m in front of right controller
-                Ray ray = controllerManager.GetControllerRay(false);
-                dragStartPoint = ray.origin + ray.direction * 1.0f;
-            }
-
+            // Tetik basıldığında küre merkezini mevcut hizalanmış konumda kilitler
+            dragStartPoint = SelectionCenter;
             isDragging = true;
-            SelectionCenter = dragStartPoint;
             SelectionRadius = minRadius;
 
             SetVisualsActive(true);
@@ -150,27 +157,66 @@ namespace MetaScan
 
         private void Update()
         {
-            if (!IsSelecting || !isDragging) return;
+            if (!IsSelecting) return;
 
-            // Update radius based on current pointer position
-            Vector3 currentPoint;
-            if (scanPointer != null && scanPointer.HasHit)
+            // Sağ analog çubuğu (Joystick) dikey hareketini (yukarı/aşağı) oku
+            float joyY = 0f;
+#if META_XR_SDK
+            Vector2 joy = OVRInput.Get(OVRInput.Axis2D.PrimaryThumbstick, OVRInput.Controller.RTouch);
+            joyY = joy.y;
+#else
+            if (Input.GetKey(KeyCode.UpArrow)) joyY = 1f;
+            else if (Input.GetKey(KeyCode.DownArrow)) joyY = -1f;
+#endif
+
+            if (Mathf.Abs(joyY) > 0.1f)
             {
-                currentPoint = scanPointer.HitPoint;
+                // Joystick ile derinliği ayarla (1.0 m/s hızında)
+                currentSelectionDistance += joyY * Time.deltaTime * 1.0f;
+                currentSelectionDistance = Mathf.Clamp(currentSelectionDistance, 0.1f, maxRadius * 2f);
+            }
+
+            if (!isDragging)
+            {
+                // Sürükleme yapmıyorken (sadece işaret ediyorken) küreyi derinliğe göre yerleştir
+                if (controllerManager != null)
+                {
+                    Ray ray = controllerManager.GetControllerRay(false);
+                    SelectionCenter = ray.origin + ray.direction * currentSelectionDistance;
+                }
+                else
+                {
+                    Camera cam = Camera.main;
+                    if (cam != null)
+                        SelectionCenter = cam.transform.position + cam.transform.forward * currentSelectionDistance;
+                }
+
+                SelectionRadius = 0.15f; // Sürükleme öncesi sabit önizleme boyutu
+                UpdateVisualTransform();
             }
             else
             {
-                Ray ray = controllerManager.GetControllerRay(false);
-                currentPoint = ray.origin + ray.direction * 1.0f;
+                // Sürüklerken (boyut ayarlıyorken) kilitli merkezden güncel işaret ucuna olan mesafeyi yarıçap yap
+                Vector3 currentPoint;
+                if (controllerManager != null)
+                {
+                    Ray ray = controllerManager.GetControllerRay(false);
+                    currentPoint = ray.origin + ray.direction * currentSelectionDistance;
+                }
+                else
+                {
+                    Camera cam = Camera.main;
+                    if (cam != null)
+                        currentPoint = cam.transform.position + cam.transform.forward * currentSelectionDistance;
+                    else
+                        currentPoint = Vector3.forward * currentSelectionDistance;
+                }
+
+                float dist = Vector3.Distance(dragStartPoint, currentPoint);
+                SelectionRadius = Mathf.Clamp(dist, minRadius, maxRadius);
+                SelectionCenter = dragStartPoint; // Merkez kilitli kalır
+                UpdateVisualTransform();
             }
-
-            float dist = Vector3.Distance(dragStartPoint, currentPoint);
-            SelectionRadius = Mathf.Clamp(dist, minRadius, maxRadius);
-
-            // Keep center at the initial point
-            SelectionCenter = dragStartPoint;
-
-            UpdateVisualTransform();
         }
 
         // =========================================================

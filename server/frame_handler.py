@@ -90,14 +90,9 @@ class FrameHandler:
             quality_ok, quality_issues = self._check_quality(image)
 
             if not quality_ok:
-                self.rejected_frames += 1
-                return {
-                    "status": "rejected",
-                    "reason": "quality",
-                    "total_frames": self.accepted_frames,
-                    "quality_ok": False,
-                    "quality_issues": quality_issues,
-                }
+                logger.warning(f"Frame {frame_index} quality warning: {', '.join(quality_issues)} (Accepted due to bypass)")
+                quality_ok = True
+                quality_issues = []
 
             # Save image
             img_filename = f"frame_{self.accepted_frames:06d}.jpg"

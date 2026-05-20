@@ -135,6 +135,7 @@ namespace MetaScan
                     handUIManager.SetConnectionStatus(true);
                     handUIManager.SetSelectButtonEnabled(true);
                     handUIManager.SetScanButtonsState(false, false);
+                    handUIManager.SetStopButtonText("[] Dur");
                     if (scanPointer != null)
                     {
                         scanPointer.SetRayActive(true);
@@ -145,8 +146,9 @@ namespace MetaScan
                 case ScanState.Selecting:
                     handUIManager.SetStatus("Cisim Secimi", selectColor);
                     handUIManager.SetInstruction("Sag tetik ile nesneye isaret edip basili tutun, surukleyerek alani belirleyin");
-                    handUIManager.SetSelectButtonEnabled(false);
-                    handUIManager.SetScanButtonsState(false, false);
+                    handUIManager.SetSelectButtonEnabled(true); // Yeniden secime izin ver
+                    handUIManager.SetScanButtonsState(false, true); // Dur (Iptal) butonunu aktif et
+                    handUIManager.SetStopButtonText("Iptal");
                     if (scanPointer != null)
                     {
                         scanPointer.SetRayActive(true);
@@ -159,6 +161,7 @@ namespace MetaScan
                     handUIManager.SetInstruction("Nesneyi sag kontrol ile tarayin. Etrafinda dolasin.");
                     handUIManager.SetSelectButtonEnabled(false);
                     handUIManager.SetScanButtonsState(false, true);
+                    handUIManager.SetStopButtonText("[] Dur");
                     if (scanPointer != null)
                     {
                         scanPointer.SetRayActive(true);
@@ -220,7 +223,9 @@ namespace MetaScan
                 handUIManager.SetStatus("Cisim Secildi", goodColor);
                 handUIManager.SetInstruction(
                     $"Alan secildi (r={radius:F2}m). Taramayi Baslat'a basin.");
-                handUIManager.SetScanButtonsState(true, false);
+                handUIManager.SetSelectButtonEnabled(true); // Yeniden secime izin ver
+                handUIManager.SetScanButtonsState(true, true); // Taramayi baslat aktif, iptal aktif
+                handUIManager.SetStopButtonText("Iptal");
             }
 
             // Stop selection mode on pointer
@@ -246,6 +251,18 @@ namespace MetaScan
 
         private void OnStopRequested()
         {
+            if (CurrentState == ScanState.Selecting)
+            {
+                if (scanPointer != null) scanPointer.SetSelectMode(false);
+                if (objectSelector != null)
+                {
+                    objectSelector.StopSelecting();
+                    objectSelector.ClearSelection();
+                }
+                SetState(ScanState.Connected);
+                return;
+            }
+
             // Stop scanning
             if (scanPointer != null) scanPointer.StopScanning();
             if (cameraCapture != null) cameraCapture.StopCapturing();

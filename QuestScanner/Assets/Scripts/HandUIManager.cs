@@ -569,6 +569,15 @@ namespace MetaScan
             if (stopButton != null) stopButton.interactable = stopEnabled;
         }
 
+        public void SetStopButtonText(string text)
+        {
+            if (stopButton != null)
+            {
+                Text t = stopButton.GetComponentInChildren<Text>();
+                if (t != null) t.text = text;
+            }
+        }
+
         public void SetConnectButtonEnabled(bool enabled)
         {
             if (connectButton != null) connectButton.interactable = enabled;

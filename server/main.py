@@ -244,6 +244,10 @@ async def websocket_scan(websocket: WebSocket):
         while True:
             data = await websocket.receive()
 
+            if data.get("type") == "websocket.disconnect":
+                logger.info(f"Quest client disconnected (session: {session_id})")
+                break
+
             if "text" in data:
                 msg = json.loads(data["text"])
                 action = msg.get("action")

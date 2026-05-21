@@ -11,6 +11,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 logger = logging.getLogger("metascan.reconstruction")
 
@@ -62,7 +63,9 @@ class ReconstructionPipeline:
 
     def _run_colmap(self) -> bool:
         """Run COLMAP Structure-from-Motion."""
-        from config import COLMAP_BINARY
+        from config import (
+            COLMAP_BINARY, COLMAP_USE_KNOWN_POSES, COLMAP_FIX_INTRINSICS
+        )
 
         colmap_path = shutil.which(COLMAP_BINARY)
         if colmap_path is None:
@@ -82,44 +85,116 @@ class ReconstructionPipeline:
             logger.warning("No COLMAP images found. Skipping COLMAP.")
             return False
 
+        # Load known intrinsics from session (if available)
+        intrinsics_path = self.session_dir / "intrinsics.json"
+        camera_params = None
+        if intrinsics_path.exists():
+            with open(intrinsics_path) as f:
+                intr = json.load(f)
+            camera_params = f"{intr['fx']},{intr['fy']},{intr['cx']},{intr['cy']}"
+            logger.info(f"Using known intrinsics: {camera_params}")
+
         try:
-            # Feature extraction
+            # ── Step 1: Feature extraction (with known intrinsics if available) ──
             logger.info("COLMAP: Feature extraction...")
-            subprocess.run([
+            feat_cmd = [
                 colmap_path, "feature_extractor",
                 "--database_path", str(colmap_db),
                 "--image_path", str(colmap_images_dir),
                 "--ImageReader.single_camera", "1",
                 "--ImageReader.camera_model", "PINHOLE",
-            ], check=True, capture_output=True, timeout=600)
+            ]
+            if camera_params and COLMAP_FIX_INTRINSICS:
+                feat_cmd += ["--ImageReader.camera_params", camera_params]
+            subprocess.run(feat_cmd, check=True, capture_output=True, timeout=600)
 
-            # Feature matching
+            # ── Step 2: Feature matching ──
             logger.info("COLMAP: Feature matching...")
             subprocess.run([
                 colmap_path, "sequential_matcher",
                 "--database_path", str(colmap_db),
             ], check=True, capture_output=True, timeout=600)
 
-            # Sparse reconstruction (with known poses if available)
-            logger.info("COLMAP: Sparse reconstruction...")
-            known_model = self.colmap_dir
-            cameras_txt = known_model / "cameras.txt"
+            # ── Step 3: Reconstruction ──
+            known_model_dir = self.colmap_dir  # Contains cameras.txt, images.txt, points3D.txt
+            cameras_txt = known_model_dir / "cameras.txt"
+            images_txt = known_model_dir / "images.txt"
 
-            if cameras_txt.exists():
+            if COLMAP_USE_KNOWN_POSES and cameras_txt.exists() and images_txt.exists():
+                # ── 3a: Convert text model to binary (required by point_triangulator) ──
+                bin_model_dir = colmap_workspace / "known_model_bin"
+                bin_model_dir.mkdir(exist_ok=True)
+                logger.info("COLMAP: Converting text model to binary...")
                 subprocess.run([
-                    colmap_path, "mapper",
-                    "--database_path", str(colmap_db),
-                    "--image_path", str(colmap_images_dir),
-                    "--output_path", str(colmap_sparse),
-                    "--input_path", str(known_model),
-                ], check=True, capture_output=True, timeout=1200)
+                    colmap_path, "model_converter",
+                    "--input_path", str(known_model_dir),
+                    "--output_path", str(bin_model_dir),
+                    "--output_type", "BIN",
+                ], check=True, capture_output=True, timeout=120)
+
+                reconstruction_success = False
+                # ── 3b: point_triangulator — keeps Quest IMU poses fixed ──
+                try:
+                    logger.info("COLMAP: Point triangulation with known poses...")
+                    subprocess.run([
+                        colmap_path, "point_triangulator",
+                        "--database_path", str(colmap_db),
+                        "--image_path", str(colmap_images_dir),
+                        "--input_path", str(bin_model_dir),
+                        "--output_path", str(colmap_sparse),
+                    ], check=True, capture_output=True, timeout=1200)
+                    logger.info("COLMAP: Point triangulation completed (poses fixed)")
+                    reconstruction_success = True
+                except subprocess.CalledProcessError as e:
+                    logger.warning(f"point_triangulator failed: {e}. Falling back to mapper.")
+
+                if not reconstruction_success:
+                    # ── 3c: Fallback — mapper with known poses as initialization ──
+                    logger.info("COLMAP: Mapper with known poses as prior...")
+                    mapper_cmd = [
+                        colmap_path, "mapper",
+                        "--database_path", str(colmap_db),
+                        "--image_path", str(colmap_images_dir),
+                        "--output_path", str(colmap_sparse),
+                        "--input_path", str(bin_model_dir),
+                    ]
+                    if COLMAP_FIX_INTRINSICS:
+                        mapper_cmd += [
+                            "--Mapper.ba_refine_focal_length", "0",
+                            "--Mapper.ba_refine_extra_params", "0",
+                        ]
+                    subprocess.run(mapper_cmd, check=True, capture_output=True, timeout=1200)
             else:
+                # ── No known poses — full mapper from scratch ──
+                logger.info("COLMAP: Mapper from scratch (no known poses)...")
                 subprocess.run([
                     colmap_path, "mapper",
                     "--database_path", str(colmap_db),
                     "--image_path", str(colmap_images_dir),
                     "--output_path", str(colmap_sparse),
                 ], check=True, capture_output=True, timeout=1200)
+            # ── Export sparse reconstruction to PLY ──
+            try:
+                ply_path = colmap_workspace / "model.ply"
+                
+                # Mapper puts it in '0/', point_triangulator puts it directly in sparse/
+                input_dir = colmap_sparse / "0"
+                if not input_dir.exists():
+                    input_dir = colmap_sparse
+                    
+                if (input_dir / "points3D.bin").exists() or (input_dir / "points3D.txt").exists():
+                    logger.info(f"COLMAP: Exporting sparse reconstruction to PLY from {input_dir}...")
+                    subprocess.run([
+                        colmap_path, "model_converter",
+                        "--input_path", str(input_dir),
+                        "--output_path", str(ply_path),
+                        "--output_type", "PLY"
+                    ], check=True, capture_output=True, timeout=120)
+                    logger.info("COLMAP: Sparse reconstruction exported to PLY")
+                else:
+                    logger.warning(f"No COLMAP points3D found in {input_dir}")
+            except Exception as e:
+                logger.warning(f"Failed to export COLMAP PLY: {e}")
 
             logger.info("COLMAP: Sparse reconstruction completed")
             return True
@@ -168,7 +243,32 @@ class ReconstructionPipeline:
         # Check if we have depth maps
         depth_files = list(self.depth_dir.glob("depth_*.raw"))
         if len(depth_files) == 0:
-            logger.info("No depth maps available. Trying point cloud from poses.")
+            logger.info("No depth maps available. Checking for COLMAP fallback.")
+            
+            # Check if COLMAP successfully created a PLY
+            colmap_ply = self.colmap_dir / "workspace" / "model.ply"
+            if colmap_ply.exists():
+                try:
+                    logger.info("Loading COLMAP reconstructed point cloud...")
+                    pcd = o3d.io.read_point_cloud(str(colmap_ply))
+                    
+                    # COLMAP point_triangulator sometimes exports pitch-black colors
+                    if pcd.has_colors():
+                        import numpy as np
+                        if np.mean(np.asarray(pcd.colors)) < 0.01:
+                            logger.info("Stripping black colors to allow viewer fallback color.")
+                            pcd.colors = o3d.utility.Vector3dVector()
+                            
+                    # Remove crazy outliers that blow up the bounding box
+                    logger.info(f"Removing outliers from {len(pcd.points)} points...")
+                    pcd, ind = pcd.remove_statistical_outlier(nb_neighbors=50, std_ratio=1.0)
+                    logger.info(f"Cleaned point cloud has {len(pcd.points)} points.")
+                            
+                    return pcd
+                except Exception as e:
+                    logger.warning(f"Failed to load COLMAP PLY: {e}")
+            
+            logger.info("Trying point cloud from poses.")
             return self._reconstruct_from_images_only(frames, intrinsics_data)
 
         # Setup Open3D intrinsics
@@ -241,11 +341,11 @@ class ReconstructionPipeline:
                 convert_rgb_to_intensity=False,
             )
 
-            # Build extrinsic matrix from pose
+            # Build world-to-camera extrinsic matrix from pose
             extrinsic = self._pose_to_extrinsic(pose)
 
-            # Integrate
-            volume.integrate(rgbd, o3d_intrinsics, np.linalg.inv(extrinsic))
+            # Integrate (extrinsic is already world-to-camera)
+            volume.integrate(rgbd, o3d_intrinsics, extrinsic)
             integrated_count += 1
 
         if integrated_count == 0:
@@ -303,33 +403,52 @@ class ReconstructionPipeline:
         ply_path = self.output_dir / f"{self.session_id}_pointcloud.ply"
         o3d.io.write_point_cloud(str(ply_path), pcd)
 
-        return None  # No mesh from sparse data alone
+        # Ensure it also gets copied to EXPORTS so the user can see it in the viewer
+        from config import EXPORTS_DIR
+        export_dir = EXPORTS_DIR / self.session_id
+        export_dir.mkdir(parents=True, exist_ok=True)
+        export_ply_path = export_dir / f"{self.session_id}_trajectory.ply"
+        import shutil
+        shutil.copy2(str(ply_path), str(export_ply_path))
+
+        # We return None for mesh, but run_full_pipeline will fail if mesh is None and colmap failed.
+        # We need a way to tell the pipeline we exported SOMETHING.
+        return pcd  # Return the pointcloud itself as a fallback!
 
     def _pose_to_extrinsic(self, pose: dict) -> np.ndarray:
-        """Convert pose dict to 4x4 extrinsic matrix."""
+        """
+        Unity camera-to-world → Open3D world-to-camera extrinsic matrix.
+
+        Applies:
+        1. Coordinate conversion: Unity (left-handed, Y-up) → Open3D (right-handed, Y-down)
+        2. Pose inversion: camera-to-world → world-to-camera
+
+        Returns 4x4 world-to-camera matrix ready for Open3D integrate().
+        """
         pos = pose["position"]
         rot = pose["rotation"]
 
-        # Quaternion to rotation matrix
-        qx, qy, qz, qw = rot["x"], rot["y"], rot["z"], rot["w"]
+        # Unity left-handed → right-handed: flip Y
+        qx = -rot["x"]
+        qy =  rot["y"]
+        qz = -rot["z"]
+        qw =  rot["w"]
 
-        r00 = 1 - 2 * (qy * qy + qz * qz)
-        r01 = 2 * (qx * qy - qz * qw)
-        r02 = 2 * (qx * qz + qy * qw)
-        r10 = 2 * (qx * qy + qz * qw)
-        r11 = 1 - 2 * (qx * qx + qz * qz)
-        r12 = 2 * (qy * qz - qx * qw)
-        r20 = 2 * (qx * qz - qy * qw)
-        r21 = 2 * (qy * qz + qx * qw)
-        r22 = 1 - 2 * (qx * qx + qy * qy)
+        px =  pos["x"]
+        py = -pos["y"]
+        pz =  pos["z"]
+
+        # Rotation matrix (camera-to-world in right-handed coords)
+        R_c2w = Rotation.from_quat([qx, qy, qz, qw]).as_matrix()
+        t_c2w = np.array([px, py, pz])
+
+        # Invert to world-to-camera (what Open3D expects)
+        R_w2c = R_c2w.T
+        t_w2c = -R_w2c @ t_c2w
 
         extrinsic = np.eye(4)
-        extrinsic[:3, :3] = np.array([
-            [r00, r01, r02],
-            [r10, r11, r12],
-            [r20, r21, r22],
-        ])
-        extrinsic[:3, 3] = [pos["x"], pos["y"], pos["z"]]
+        extrinsic[:3, :3] = R_w2c
+        extrinsic[:3,  3] = t_w2c
 
         return extrinsic
 
@@ -349,7 +468,26 @@ class ReconstructionPipeline:
 
         exports = []
 
-        # Convert Open3D mesh to trimesh for multi-format export
+        # Determine if it's a mesh or point cloud
+        is_pointcloud = not hasattr(mesh, 'triangles')
+
+        if is_pointcloud:
+            try:
+                ply_path = export_dir / f"{self.session_id}_points.ply"
+                o3d.io.write_point_cloud(str(ply_path), mesh)
+                exports.append({
+                    "format": "PLY",
+                    "filename": ply_path.name,
+                    "path": str(ply_path),
+                    "size_mb": round(ply_path.stat().st_size / (1024 * 1024), 2),
+                    "url": f"/exports/{self.session_id}/{ply_path.name}",
+                })
+                logger.info(f"Exported PLY point cloud: {ply_path.name}")
+            except Exception as e:
+                logger.error(f"PLY export failed: {e}")
+            return exports
+
+        # It's a triangle mesh, convert Open3D mesh to trimesh for multi-format export
         vertices = np.asarray(mesh.vertices)
         triangles = np.asarray(mesh.triangles)
         vertex_colors = None

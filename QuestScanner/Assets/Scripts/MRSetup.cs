@@ -57,9 +57,15 @@ namespace MetaScan
                 }
             }
 
-            // Set tracking origin to stage (standing use)
-            OVRManager.TrackingOrigin trackingOrigin = OVRManager.TrackingOrigin.Stage;
+            // Set tracking origin to FloorLevel for better walking experience
+            OVRManager.TrackingOrigin trackingOrigin = OVRManager.TrackingOrigin.FloorLevel;
             ovrManager.trackingOriginType = trackingOrigin;
+
+            // Disable boundary visibility to prevent the stationary circle from restricting movement
+            if (OVRManager.boundary != null)
+            {
+                OVRManager.boundary.SetVisible(false);
+            }
 
             Debug.Log("[MetaScan-MR] Passthrough configured: enabled=" + enablePassthrough);
 #else

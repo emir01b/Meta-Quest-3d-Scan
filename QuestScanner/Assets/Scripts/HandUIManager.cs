@@ -25,8 +25,8 @@ namespace MetaScan
         [SerializeField] private float canvasWidth = 0.32f;
         [SerializeField] private float canvasHeight = 0.26f;
         [SerializeField] private float canvasScale = 0.001f;
-        [SerializeField] private Vector3 canvasOffset = new Vector3(0.05f, 0.1f, -0.08f);
-        [SerializeField] private Vector3 canvasRotation = new Vector3(30f, 0f, 0f);
+        [SerializeField] private Vector3 canvasOffset = new Vector3(0.05f, 0.35f, 0.05f);
+        [SerializeField] private Vector3 canvasRotation = new Vector3(15f, 0f, 0f);
 
         [Header("Colors")]
         [SerializeField] private Color panelColor = new Color(0.05f, 0.05f, 0.12f, 0.94f);

@@ -11,6 +11,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 from config import (
     FRAME_MAGIC, FRAME_HEADER_SIZE,
@@ -248,6 +249,45 @@ class FrameHandler:
             },
         }
 
+    def _unity_pose_to_colmap(self, pose: dict) -> tuple:
+        """
+        Convert Unity camera-to-world pose to COLMAP world-to-camera format.
+
+        Unity:  left-handed, Y-up, camera-to-world
+        COLMAP: right-handed, Y-down, world-to-camera
+
+        Returns: (qw, qx, qy, qz, tx, ty, tz) for COLMAP images.txt
+        """
+        pos = pose["position"]
+        rot = pose["rotation"]
+
+        # 1. Flip Y axis: Unity (Y-up) → COLMAP (Y-down)
+        #    Position: (x, -y, z)
+        px_c2w = pos["x"]
+        py_c2w = -pos["y"]
+        pz_c2w = pos["z"]
+
+        # 2. Quaternion for Y-flip: T*R*T where T=diag(1,-1,1)
+        #    Result: (qw, -qx, qy, -qz)
+        qw_c2w = rot["w"]
+        qx_c2w = -rot["x"]
+        qy_c2w = rot["y"]
+        qz_c2w = -rot["z"]
+
+        # 3. Invert: camera-to-world → world-to-camera
+        #    Quaternion inverse (conjugate for unit quat): (qw, -qx, -qy, -qz)
+        qw_w2c = qw_c2w
+        qx_w2c = -qx_c2w
+        qy_w2c = -qy_c2w
+        qz_w2c = -qz_c2w
+
+        # 4. Translation: t_w2c = -R_w2c @ t_c2w
+        R_w2c = Rotation.from_quat([qx_w2c, qy_w2c, qz_w2c, qw_w2c]).as_matrix()
+        t_c2w = np.array([px_c2w, py_c2w, pz_c2w])
+        t_w2c = -R_w2c @ t_c2w
+
+        return qw_w2c, qx_w2c, qy_w2c, qz_w2c, t_w2c[0], t_w2c[1], t_w2c[2]
+
     def save_session_metadata(self):
         """Save session metadata to JSON file."""
         elapsed = time.time() - self.start_time
@@ -302,7 +342,7 @@ class FrameHandler:
                 f.write("#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
                 f.write(f"1 PINHOLE {w} {h} {fx} {fy} {cx} {cy}\n")
 
-        # Write images.txt with known poses
+        # Write images.txt with known poses (Unity → COLMAP coordinate conversion)
         images_path = colmap_dir / "images.txt"
         with open(images_path, "w") as f:
             f.write("# Image list with two lines per image:\n")
@@ -312,13 +352,8 @@ class FrameHandler:
                 pose = frame.get("pose")
                 if pose is None:
                     continue
-                qw = pose["rotation"]["w"]
-                qx = pose["rotation"]["x"]
-                qy = pose["rotation"]["y"]
-                qz = pose["rotation"]["z"]
-                tx = pose["position"]["x"]
-                ty = pose["position"]["y"]
-                tz = pose["position"]["z"]
+                # Convert Unity (left-hand, camera-to-world) → COLMAP (right-hand, world-to-camera)
+                qw, qx, qy, qz, tx, ty, tz = self._unity_pose_to_colmap(pose)
                 f.write(
                     f"{i + 1} {qw} {qx} {qy} {qz} {tx} {ty} {tz} 1 {frame['image']}\n"
                 )

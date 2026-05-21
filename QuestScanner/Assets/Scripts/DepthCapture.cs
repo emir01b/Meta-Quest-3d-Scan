@@ -7,6 +7,11 @@
 
 using UnityEngine;
 
+#if META_XR_SDK
+using Meta.XR;
+using Meta.XR.EnvironmentDepth;
+#endif
+
 namespace MetaScan
 {
     public class DepthCapture : MonoBehaviour
@@ -43,14 +48,18 @@ namespace MetaScan
                 return;
             }
 
-            // Check if depth API is supported
             OVRManager ovrManager = FindFirstObjectByType<OVRManager>();
             if (ovrManager != null)
             {
-                // Enable environment depth
-                // Note: This requires "Environment Depth" to be enabled in OVRManager
-                // and the correct permissions in AndroidManifest
-                Debug.Log("[MetaScan-Depth] Depth API initialization attempted");
+                // In Meta SDK v60+, Depth is handled via EnvironmentDepthManager component
+                EnvironmentDepthManager depthManager = ovrManager.GetComponent<EnvironmentDepthManager>();
+                if (depthManager == null) {
+                    depthManager = ovrManager.gameObject.AddComponent<EnvironmentDepthManager>();
+                }
+                depthManager.RemoveHands = true;
+                depthManager.enabled = true;
+                
+                Debug.Log("[MetaScan-Depth] EnvironmentDepthManager attached and enabled.");
                 IsDepthAvailable = true;
             }
 #else

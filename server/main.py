@@ -191,7 +191,8 @@ async def reconstruction_status(session_id: str):
     if task.done():
         try:
             result = task.result()
-            return {"status": "completed", "result": result}
+            status = result.get("status", "completed")
+            return {"status": status, "result": result}
         except Exception as e:
             return {"status": "failed", "error": str(e)}
     else:

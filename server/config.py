@@ -46,10 +46,12 @@ MIN_FRAMES_FOR_RECONSTRUCTION = 20
 MAX_FRAMES_FOR_RECONSTRUCTION = 500
 
 # COLMAP parameters
-COLMAP_BINARY = os.environ.get("COLMAP_PATH", "colmap")
+COLMAP_BINARY = r"C:\Users\stnm\Desktop\COLMAP\COLMAP.bat"
 COLMAP_CAMERA_MODEL = "PINHOLE"
 COLMAP_MATCHER = "sequential"
 COLMAP_MAX_IMAGE_SIZE = 1280
+COLMAP_USE_KNOWN_POSES = True     # Quest IMU pozlarını sabit tut (point_triangulator)
+COLMAP_FIX_INTRINSICS = True      # Kamera intrinsics'i bundle adjustment'ta sabitle
 
 # Open3D TSDF parameters
 TSDF_VOXEL_LENGTH = 0.005     # 5mm voxel size

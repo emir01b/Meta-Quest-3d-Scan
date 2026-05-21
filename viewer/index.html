@@ -337,15 +337,15 @@
     <div class="toasts" id="toasts"></div>
 
     <!-- Three.js -->
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r170/three.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/three@0.170.0/examples/js/controls/OrbitControls.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/three@0.170.0/examples/js/loaders/OBJLoader.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/three@0.170.0/examples/js/loaders/MTLLoader.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/three@0.170.0/examples/js/loaders/GLTFLoader.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/three@0.170.0/examples/js/loaders/PLYLoader.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/three@0.170.0/examples/js/loaders/STLLoader.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/three@0.170.0/examples/js/exporters/STLExporter.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/three@0.170.0/examples/js/exporters/OBJExporter.js"></script>
+    <script src="js/three.min.js"></script>
+    <script src="js/OrbitControls.js"></script>
+    <script src="js/OBJLoader.js"></script>
+    <script src="js/MTLLoader.js"></script>
+    <script src="js/GLTFLoader.js"></script>
+    <script src="js/PLYLoader.js"></script>
+    <script src="js/STLLoader.js"></script>
+    <script src="js/STLExporter.js"></script>
+    <script src="js/OBJExporter.js"></script>
     <script>
         // =================================================================
         // Scene Setup
@@ -433,10 +433,16 @@
             const box = new THREE.Box3().setFromObject(obj);
             const center = box.getCenter(new THREE.Vector3());
             const size = box.getSize(new THREE.Vector3());
-            const maxDim = Math.max(size.x, size.y, size.z);
+            const maxDim = Math.max(size.x, size.y, size.z, 0.001);
 
-            obj.position.sub(center);
-            obj.scale.multiplyScalar(2 / maxDim);
+            obj.traverse(c => {
+                if (c.geometry) {
+                    c.geometry.translate(-center.x, -center.y, -center.z);
+                }
+            });
+
+            obj.position.set(0, 0, 0);
+            obj.scale.setScalar(2 / maxDim);
 
             obj.traverse(c => {
                 if (c.isMesh) {
@@ -458,12 +464,15 @@
             controls.update();
 
             // Stats
+            // Stats
             let verts = 0, faces = 0;
             obj.traverse(c => {
-                if (c.isMesh && c.geometry) {
+                if ((c.isMesh || c.isPoints) && c.geometry) {
                     const g = c.geometry;
                     verts += g.attributes.position ? g.attributes.position.count : 0;
-                    faces += g.index ? g.index.count / 3 : (g.attributes.position ? g.attributes.position.count / 3 : 0);
+                    if (c.isMesh) {
+                        faces += g.index ? g.index.count / 3 : (g.attributes.position ? g.attributes.position.count / 3 : 0);
+                    }
                 }
             });
 
@@ -494,12 +503,23 @@
                     break;
                 case 'ply':
                     new THREE.PLYLoader().load(url, geo => {
-                        geo.computeVertexNormals();
-                        const mat = new THREE.MeshStandardMaterial({
-                            color: 0x8888cc, roughness: 0.5, metalness: 0.1,
-                            vertexColors: geo.hasAttribute('color'),
-                        });
-                        addModel(new THREE.Mesh(geo, mat), 'PLY');
+                        let obj;
+                        if (geo.index) {
+                            geo.computeVertexNormals();
+                            const mat = new THREE.MeshStandardMaterial({
+                                color: 0x8888cc, roughness: 0.5, metalness: 0.1,
+                                vertexColors: geo.hasAttribute('color'),
+                            });
+                            obj = new THREE.Mesh(geo, mat);
+                        } else {
+                            const mat = new THREE.PointsMaterial({
+                                size: 0.005,
+                                vertexColors: geo.hasAttribute('color'),
+                                color: geo.hasAttribute('color') ? 0xffffff : 0x8888cc
+                            });
+                            obj = new THREE.Points(geo, mat);
+                        }
+                        addModel(obj, 'PLY');
                     }, onProg, onErr);
                     break;
                 case 'stl':
@@ -660,7 +680,7 @@
                 }
 
                 list.innerHTML = data.sessions.map(s => `
-                    <div class="session" onclick="selectSession('${s.session_id}')">
+                    <div class="session" id="session-${s.session_id}" onclick="selectSession('${s.session_id}')">
                         <div class="name">${s.session_id}</div>
                         <div class="meta">${s.frame_count} frame${s.duration ? ' • ' + s.duration + 's' : ''}</div>
                     </div>
@@ -678,7 +698,8 @@
 
         async function selectSession(id) {
             document.querySelectorAll('.session').forEach(s => s.classList.remove('active'));
-            event.currentTarget.classList.add('active');
+            const el = document.getElementById('session-' + id);
+            if (el) el.classList.add('active');
 
             try {
                 const res = await fetch(API + '/api/sessions/' + id + '/exports');

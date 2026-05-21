@@ -19,6 +19,7 @@
   <uses-feature android:name="oculus.software.overlay_keyboard" android:required="false" />
   <uses-permission android:name="horizonos.permission.HEADSET_CAMERA" />
   <uses-permission android:name="android.permission.CAMERA" />
+  <uses-permission android:name="com.oculus.permission.USE_SCENE" />
   <uses-feature android:name="com.oculus.feature.CAMERA_ACCESS" android:required="false" />
   <horizonos:uses-horizonos-sdk horizonos:minSdkVersion="60" horizonos:targetSdkVersion="85" />
 </manifest>

@@ -34,9 +34,10 @@ namespace MetaScan
         private Transform headTransform;
         private float nextCaptureTime;
 
-        // Camera intrinsics (estimated defaults for Quest 3S)
-        private float focalLengthX = 640f;
-        private float focalLengthY = 640f;
+        // Camera intrinsics (estimated defaults for Quest 3S passthrough)
+        // Horizontal FOV is ~110 degrees. fx = (1280/2) / tan(110/2) = 640 / 1.428 = 448
+        private float focalLengthX = 448f;
+        private float focalLengthY = 448f;
         private float principalPointX = 640f;
         private float principalPointY = 480f;
 
@@ -157,6 +158,27 @@ namespace MetaScan
 #endif
             Camera cam = Camera.main;
             if (cam != null) headTransform = cam.transform;
+
+#if META_XR_SDK
+            // Instead of hallucinated OVRPlugin.GetIntrinsics, read directly from the Unity Camera
+            // which OVRManager already updates with the real hardware intrinsics per frame!
+            Camera centerCam = headTransform != null ? headTransform.GetComponent<Camera>() : Camera.main;
+            if (centerCam != null) {
+                // The projection matrix P[0,0] is (2 * near) / (right - left)
+                // In terms of focal length: P[0,0] = fx_normalized = 2 * fx / width
+                // So fx = P[0,0] * width / 2
+                float fx = centerCam.projectionMatrix[0, 0] * (captureWidth / 2f);
+                float fy = centerCam.projectionMatrix[1, 1] * (captureHeight / 2f);
+                
+                if (fx > 0 && fy > 0) {
+                    focalLengthX = fx;
+                    focalLengthY = fy;
+                    principalPointX = captureWidth / 2f;
+                    principalPointY = captureHeight / 2f;
+                    Debug.Log($"[MetaScan-Camera] Real Intrinsics from Camera Matrix: fx={focalLengthX}, fy={focalLengthY}");
+                }
+            }
+#endif
         }
 
         public void StartCapturing()

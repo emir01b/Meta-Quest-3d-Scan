@@ -1,39 +1,50 @@
 # MetaScan — Meta Quest ile 3D Nesne Taraması ve Görüntü İşleme Pipeline’ı
 
-Bu depo, **görüntü işleme** ve **bilgisayarlı görü** kavramlarını bir **MR/VR ortamından (Meta Quest)** akış olarak kullanan ders projesidir: passthrough/eldeki kameradan görüntü + (isteğe bağlı) derinlik + baş/poz verisi bilgisayara aktarılır; sunucu tarafında **kalite kontrolü**, **oturum yönetimi** ve **3D yeniden yapılandırma** yapılır.
+Bu depo, **görüntü işleme** ve **bilgisayarlı görü** (Computer Vision) kavramlarını bir **karma gerçeklik (MR) başlığı (Meta Quest 3/3S)** üzerinden uçtan uca uygulayan ders projesidir:
+Passthrough kameradan alınan RGB görüntüler, başlığın ürettiği **derinlik haritaları (Environment Depth)** ve anlık **baş poz (pose) verileri** gerçek zamanlı olarak bilgisayara aktarılır; sunucu tarafında **kalite kontrolü (bulanıklık ve pozlama analizi)**, **oturum yönetimi** ve **3D yeniden yapılandırma (COLMAP / Open3D TSDF Fusion)** işlemleri gerçekleştirilir.
 
 ---
 
-## Özet Mimari
+## Özet Mimari ve Veri Akışı
 
-Sistem üç ana bloktan oluşur:
+Sistem üç ana bileşenden oluşmaktadır:
 
 | Bileşen | Teknoloji | Rol |
 |--------|-----------|-----|
-| **İstemci (başlık)** | Unity (C#), Meta XR SDK (`META_XR_SDK`) | Tarama akışını yönetir, kare yakalar, ikili protokolle WebSocket üzerinden sunucuya gönderir |
-| **Sunucu** | FastAPI + Uvicorn, WebSocket | Kareleri doğrular, diske kaydeder, COLMAP/Open3D ile mesh üretimini tetikler |
-| **Web görüntüleyici** | Statik HTML (`viewer/`) | Sunucunun `/viewer` üzerinden servis ettiği arayüz |
+| **İstemci (Başlık)** | Unity (C#), Meta XR SDK (v85) | Passthrough/RGB kareleri yakalar, derinlik haritalarını milimetre cinsinden okur, poz ve iç kamera matrisi ile birlikte ikili (binary) paketler halinde WebSocket üzerinden sunucuya aktarır. |
+| **Sunucu (Reconstruction)** | Python (FastAPI, Open3D, OpenCV, COLMAP) | WebSocket üzerinden gelen verileri ayrıştırır, kalite kontrolü yapar, diske kaydeder ve arka planda 3D rekonstrüksiyon (TSDF Fusion veya SfM) işlemlerini yönetir. |
+| **Web Görüntüleyici** | HTML5, Three.js (Statik) | Üretilen 3D modelleri (PLY, OBJ, GLB) tarayıcı üzerinde görüntülemeyi sağlayan hafif arayüzdür. |
 
 ```mermaid
-flowchart LR
-  subgraph Quest["Meta Quest Unity"]
+flowchart TD
+  subgraph Quest["Meta Quest 3/3S (Unity İstemci)"]
     SM[ScanManager]
     CC[CameraCapture]
     DC[DepthCapture]
     DS[DataStreamer]
+    
     SM --> CC
     SM --> DS
     DS --> CC
     DS --> DC
   end
-  subgraph PC["Python Sunucu"]
-    WS["/ws/scan"]
-    FH[FrameHandler]
+  
+  subgraph PC["Python Sunucusu (FastAPI + Uvicorn)"]
+    WS["/ws/scan (WebSocket)"]
+    FH[FrameHandler - Kalite Kontrolü]
     RP[ReconstructionPipeline]
+    
     WS --> FH
     FH --> RP
   end
-  Quest <-->|WebSocket ikili + JSON| PC
+  
+  subgraph Viewer["Web Görüntüleyici"]
+    UI[viewer/index.html]
+    T3[Three.js Loader & Controls]
+  end
+
+  Quest <-->|WebSocket Binary + JSON| PC
+  PC -->|Static Servis| Viewer
 ```
 
 ---
@@ -41,188 +52,117 @@ flowchart LR
 ## Dizin Yapısı
 
 ```
-meta_scan/
-├── QuestScanner/          # Unity projesi (Android / Quest hedefli build)
-│   └── Assets/Scripts/    # MetaScan namespace — tüm istemci mantığı
-├── server/                # FastAPI sunucusu
-│   ├── main.py
-│   ├── frame_handler.py
-│   ├── reconstruction.py
-│   ├── config.py
-│   └── data/              # Oturumlar ve exportlar (çalışma zamanında oluşur)
-├── viewer/                # Tarayıcı 3D model görüntüleyici (index.html)
+Meta-Quest-3d-Scan/
+├── QuestScanner/          # Unity Projesi (Android / Meta Quest Hedefli)
+│   ├── Assets/
+│   │   ├── Plugins/Android/
+│   │   │   └── AndroidManifest.xml # Scene ve Kamera İzinleri
+│   │   ├── Scripts/       # MetaScan ad alanı altındaki C# kodları
+│   │   │   ├── SceneBootstrapper.cs
+│   │   │   ├── MRSetup.cs
+│   │   │   ├── ScanManager.cs
+│   │   │   ├── CameraCapture.cs    # RGB Kamera ve Intrinsics Hesaplama
+│   │   │   ├── DepthCapture.cs     # Environment Depth API Entegrasyonu
+│   │   │   ├── HandUIManager.cs
+│   │   │   └── DataStreamer.cs     # WebSocket Binary Protokol Akışı
+│   │   └── Resources/     # Proje Konfigürasyon Dosyaları
+│   └── ProjectSettings/   # Unity Proje Ayarları
+├── server/                # Python FastAPI Sunucusu
+│   ├── main.py            # FastAPI API & WebSocket Giriş Noktası
+│   ├── frame_handler.py   # Paket Ayrıştırma, OpenCV Kalite Kontrolü (Blur, Exposure)
+│   ├── reconstruction.py  # Open3D TSDF Fusion, Outlier Filtreleme ve COLMAP Entegrasyonu
+│   ├── config.py          # Sistem Parametreleri ve Eşik Değerler
+│   └── requirements.txt   # Sunucu Bağımlılıkları
+├── viewer/                # Statik 3D Web Viewer Arayüzü
+│   ├── index.html         # Arayüz ve WebGL Görüntüleme Mantığı
+│   └── js/                # İnternetsiz çalışma için statik Three.js Kütüphaneleri
 └── README.md
 ```
 
 ---
 
-## İstemci (Unity — `QuestScanner`)
+## Son Yapılan Kritik İyileştirmeler ve Çözülen Hatalar
 
-Tüm özel betikler `MetaScan` ad alanında toplanmıştır. Sahne **`SceneBootstrapper`** ile kurulur: `ScanSystem` adlı kök nesneye sırayla MR, giriş, UI, seçim, akış ve yöneticiler eklenir.
+Projenin önceki sürümlerinde karşılaşılan ve 3D taramayı engelleyen temel sorunlar yeni mimari yapıyla tamamen giderilmiştir:
 
-### Çekirdek betikler ve sorumlulukları
+### 1. Meta Quest 3S ve v85 SDK için Derinlik Haritası (Environment Depth) Düzeltmesi
+* **Hata:** Derinlik haritası alınamadığı için TSDF Integration devreye girmiyordu ve sadece RGB kareleriyle COLMAP nokta bulutu oluşturulabiliyordu. Sonuçta mesh değil eksik noktalar elde ediliyordu.
+* **Çözüm:** 
+  * `AndroidManifest.xml` içerisine Quest 3'ün fiziksel çevre algılama yeteneğini kullanabilmesi için `<uses-permission android:name="com.oculus.permission.USE_SCENE" />` izni eklendi.
+  * Meta SDK v85 uyumlu `EnvironmentDepthManager` yapısına geçiş yapıldı. `DepthCapture.cs` içerisine `using Meta.XR.EnvironmentDepth;` eklenerek `OVRManager` GameObject'ine çalışma zamanında bu bileşen otomatik bağlandı ve ellerin derinlik haritasından çıkarılması (`RemoveHands = true`) sağlandı.
 
-| Script | Görev |
-|--------|--------|
-| **SceneBootstrapper** | OVRCameraRig kontrolü; `ScanSystem` altında bileşenleri oluşturur |
-| **MRSetup** | Passthrough (`OVRPassthroughLayer`), şeffaf arka plan kamera ayarı, `Stage` takip başlangıcı |
-| **ScanManager** | **Durum makinesi**: Idle → Connecting → Connected → Selecting → Scanning → Processing → Complete / Error |
-| **ControllerManager** | Sol/sağ el anchor’ları (`OVRCameraRig` veya düzenleyici için sahte anchor); OVR tetik/grıp olayları; haptik |
-| **HandUIManager** | Sol el grip ile açılıp kapanan **World Space Canvas** (bağlantı IP/port, Tara/Dur, ilerleme çubuğu) |
-| **VRUIPointer** | Panel görünürken sağ kontrolciden UI’ye laser; **Physics.Raycast** + dünya noktasını `RectTransform` içinde test; `Button.onClick.Invoke` |
-| **ScanPointer** | Sahne nesnelerine lazer (**Physics.Raycast**), tarama sırasında renk/mod değişimi |
-| **ObjectSelector** | Sağ tetik basılı tutarak merkez + sürükleyerek yarıçap ile **seçim küresi**; üç halka `LineRenderer` |
-| **PointCloudVisualizer** | Kabul edilen kare geri bildirimine göre **parçacık sistemi** ile “taramaCoverage” görselleştirmesi |
-| **CameraCapture** | `RenderTexture` + `Camera.Render` ile kare yakalama, **JPEG** (`EncodeToJPG`), varsayılan **pinhole iç parametreleri** (fx,fy,cx,cy); baş pozu/quaternion ile birlikte `CapturedFrame` |
-| **DepthCapture** | `META_XR_SDK` ile `_EnvironmentDepthTexture` okuma; float metre → uint16 mm byte dizisi (`GetDepthData`) |
-| **DataStreamer** | `System.Net.WebSockets.ClientWebSocket` tabanlı hafif istemci; **ikili çerçeve paketleme**, kuyruk (`maxQueueSize`), sunucudan gelen JSON geri bildirimi basit string ayrıştırma ile |
+### 2. Dinamik Kamera İç Parametreleri (Intrinsics) Hesaplama
+* **Hata:** Kameranın odak uzaklığı (focal length) sabit/tahmini değerlerle (örn: 448 px) sunucuya gönderildiği için Open3D TSDF Fusion ve COLMAP projeksiyon hesaplamaları hatalı oluyordu (Nesnelerin koordinatları milimetre yerine 133 metre gibi devasa boyutlarda çıkıyordu).
+* **Çözüm:** `CameraCapture.cs` içinde Unity Kamerası'nın gerçek projeksiyon matrisi (`projectionMatrix`) dinamik olarak çözümlendi:
+  $$f_x = P_{0,0} \cdot \frac{\text{width}}{2}$$
+  $$f_y = P_{1,1} \cdot \frac{\text{height}}{2}$$
+  Bu sayede başlığın fiziksel kamera kalibrasyonu (OVRManager tarafından güncellenen gerçek donanım matrisi) doğrudan Python rekonstrüksiyon pipeline'ına iletilmektedir.
 
-### Durum makinesi (ScanManager)
+### 3. Open3D İstatistiksel Gürültü Filtresi (Statistical Outlier Removal) Entegrasyonu
+* **Hata:** Taramada oluşan saçma/gürültülü noktalar nedeniyle modelin sınır kutusu (bounding box) devasa boyutlara ulaşıyor, asıl taranan nesne viewer ekranında görünmeyecek kadar küçülüyordu.
+* **Çözüm:** `server/reconstruction.py` içerisine istatistiksel aykırı değer temizleme filtresi eklendi:
+  ```python
+  pcd, ind = pcd.remove_statistical_outlier(nb_neighbors=50, std_ratio=1.0)
+  ```
+  Bu filtre, komşu noktalarından istatistiksel olarak çok uzak kalan tüm toz ve parazit pikselleri temizleyerek modelin gerçek boyutlarında kalmasını sağlar.
 
-- **Idle**: Sunucuya bağlan hazır.
-- **Connecting / Connected**: WebSocket `ws://IP:8765/ws/scan`.
-- **Selecting**: Kullanıcı nesne alanını seçer; `PointCloudVisualizer.ClearPoints()` temizlenir.
-- **Scanning**: `CameraCapture.StartCapturing()` + `DataStreamer.StartSession("scan")`; hedef kare sayısı (varsayılan 200), minimum kare (`minFramesRequired`, 30) ve zaman aşımı (`scanTimeout`, 300 s).
-- **Processing / Complete**: Sunucunun kabulü yeterliyse kullanıcıya “işleniyor / tamam” mesajı; gerçek 3D üretimi sunucuda veya REST ile tetiklenebilir.
-
-### Kullanılan görüntü/görsel yapılar (ders açısından)
-
-- **Dünya uzayı UI**: Billboard olmayan düz canvas; küresel seçim görselleştirmesi ve lazer için **projeksiyon geometrisi** (ışın → düzlem).
-- **Kamera modeli**: Pinhole yaklaşımı; iç parametreler paketle gönderilir (gerçek cihazda OVR kamerasından kalibre edilerek güncellenebilir — `CameraCapture.SetIntrinsics`).
-- **JPEG kodlama**: Bant genişliği/disk için sıkıştırma (Unity tarafında kalite; sunucuya kayıtta OpenCV ile tekrar yazım — kalite 95).
+### 4. Web Viewer Vertex Sayım Hatası Giderildi
+* **Hata:** Viewer model yüklendiğinde "0 vertices" hatası veriyordu.
+* **Çözüm:** `viewer/index.html` üzerinde model ağacı taranırken sadece `THREE.Mesh` değil, nokta bulutu formatındaki nesneleri de kapsayacak şekilde `THREE.Points` kontrolü eklendi. Ayrıca tüm Three.js bağımlılıkları (`viewer/js/`) yerel olarak sunularak harici CDN bağımlılığı kaldırıldı.
 
 ---
 
-## Sunucu (Python — `server/`)
+## İkili (Binary) Çerçeve Protokolü
 
-### Giriş noktası: `main.py`
+Ağ bant genişliğini optimize etmek amacıyla, Quest başlığından sunucuya akan her kare tek bir TCP paketi halinde paketlenir. İstemci ile sunucu arasındaki ikili protokolün yapısı şu şekildedir:
 
-- **FastAPI** uygulaması; **CORS** açık (web viewer için).
-- **Yaşam döngüsü**: Başlangıçta adresleri loglar; kapanırken rekonstrüksiyon görevleri iptal edilir.
-- **Statik dosyalar**: `viewer/` → `http://host:8765/viewer`, `data/exports` → `/exports`.
-
-### REST uçları (özet)
-
-| Metod | Yol | Açıklama |
-|-------|-----|----------|
-| GET | `/api/health` | Sağlık kontrolü |
-| GET | `/api/sessions` | Oturum listesi (`session_metadata.json` veya `images/*.jpg` sayımı) |
-| GET | `/api/sessions/{id}` | Oturum detayı |
-| POST | `/api/sessions/{id}/reconstruct?method=full\|colmap\|tsdf` | Ark planda rekonstrüksiyon görevi |
-| GET | `/api/sessions/{id}/reconstruction/status` | Görev durumu |
-| GET | `/api/sessions/{id}/exports` | Export dosya listesi ve URL’ler |
-
-### WebSocket: `/ws/scan`
-
-1. İstemci: `{"action":"start_session","name":"..."}` → sunucu: `session_started` + `session_id`.
-2. İstemci ikili gövdede sırayla kare gönderir.
-3. Sunucu her kare için `frame_result` (kalite, toplam kabul edilen kare vb.) döner.
-4. `{"action":"stop_session"}` ile oturum kapanır; metadata ve COLMAP girdisi hazırlanır.
-
-### `frame_handler.py` — Görüntü işleme ve depolama
-
-- **Çerçeve ayrıştırma**: `FRAME_MAGIC = b"MSF\x01"`, başlık 32 bayt (`struct` ile little-endian): indeks, zaman damgası, JPEG uzunluğu, derinlik uzunluğu, poz uzunluğu, içparam uzunluğu.
-- **Görüntü çözme**: OpenCV `imdecode`.
-- **Kalite kontrolü** (`_check_quality`):
-  - **Bulanıklık**: Gri tonlamada **Laplacian varyansı** (`cv2.Laplacian`). Eşik: `BLUR_THRESHOLD` (`config.py`, varsayılan 100).
-  - **Pozlama**: Gri ortalaması `EXPOSURE_MIN`–`EXPOSURE_MAX` (30–230) aralığı dışına çıkmamalı.
-
-Bu iki ölçüt, klasik **no-reference görüntü kalitesi** ve **histogram/parlaklık analizi** ders bağlantıları için doğrudan örnek teşkil eder.
-
-- **Kayıt**: `images/frame_XXXXXX.jpg`, isteğe bağlı `depth/depth_XXXXXX.raw`, `poses/pose_XXXXXX.json`, ilk çerçevede `intrinsics.json`.
-
-### `reconstruction.py` — 3D yeniden yapılandırma
-
-- **COLMAP** (PATH’te `colmap` veya `COLMAP_PATH`):
-  - `feature_extractor`, `sequential_matcher`, `mapper`.
-  - `prepare_colmap_input`: `cameras.txt` (PINHOLE), `images.txt` (bilinen quaternion + çeviri ile COLMAP’e ipucu), görüntüler için symlink/kopya.
-
-- **Open3D TSDF birleştirme** (`ScalableTSDFVolume`):
-  - RGB-D çiftleri, pozdan **dış parametre matrisi** (`_pose_to_extrinsic`).
-  - Derinlik: uint16 mm, `depth_scale` 1000 → metre; `TSDF_DEPTH_MAX` ile kesim.
-
-- **Dışa aktarım**: `trimesh` ile **OBJ, STL, GLB**; Open3D ile **PLY**.
-
-- **Fallback**: Derinlik yoksa seyrek bulut oluşturulup PLY olarak yazılabilir; tam mesh için veri eksik kalabilir.
-
-### `config.py` — Tek merkezi yapılandırma
-
-Oturum dizinleri, kamera çözünürlüğü (1280×960), kalite eşikleri, TSDF voxel/trunc yüz simplifikasyon hedefi (`TARGET_FACE_COUNT`), ikili protokol sabitleri ve isteğe bağlı `SessionInfo` dataclass.
-
----
-
-## İkili Çerçeve Protokolü (istemci ←→ sunucu)
-
-Sıra (sunucu `config.py` ile uyumlu):
-
-1. Magic 4 bayt: `MSF\x01`
-2. `uint32` frame index, `float64` timestamp (saniye)
-3. `uint32` × 4: JPEG, depth, poz, içparam uzunlukları
-4. JPEG baytları
-5. Depth (uint16 little-endian mm, sıralı düz dizi — genişlik×yükseklik)
-6. Poz: 7× `float32` — px, py, pz, qx, qy, qz, qw
-7. İçparam: 4× `float32` — fx, fy, cx, cy
+1. **Magic Header (4 byte):** Sabit `MSF\x01` imzası.
+2. **Metadata (24 byte):**
+   * `uint32` Kare Endeksi (Frame Index)
+   * `float64` Zaman Damgası (Timestamp)
+   * `uint32` JPEG Boyutu
+   * `uint32` Derinlik Haritası (Depth) Veri Boyutu
+   * `uint32` Poz (Pose) Veri Boyutu
+   * `uint32` Kamera İç Parametreleri (Intrinsics) Boyutu
+3. **JPEG RGB Payload:** Sıkıştırılmış kamera karesi.
+4. **Depth Payload:** `uint16` tipinde, milimetre cinsinden düzleştirilmiş derinlik dizisi (Genişlik × Yükseklik).
+5. **Pose Payload:** 7 adet `float32` değer (Pozisyon: X, Y, Z; Rotasyon/Quaternion: X, Y, Z, W).
+6. **Intrinsics Payload:** 4 adet `float32` değer (`fx`, `fy`, `cx`, `cy`).
 
 ---
 
 ## Kurulum ve Çalıştırma
 
-### Sunucu
+### 1. Sunucuyu Başlatma
+Sunucu makinesinde Python 3.10+ yüklü olmalıdır.
 
 ```bash
 cd server
 python -m venv .venv
-.venv\Scripts\activate          # Windows
+.venv\Scripts\activate      # Windows için aktif etme
+# Linux/macOS için: source .venv/bin/activate
 pip install -r requirements.txt
 python main.py
 ```
+* Sunucu varsayılan olarak **8765** portunda WebSocket ve HTTP isteklerini dinler.
+* Tarayıcınızdan `http://localhost:8765/viewer` adresine giderek 3D görüntüleyiciye erişebilirsiniz.
+* *Not:* Tam rekonstrüksiyon (SfM) pipeline'ı için sisteminizde [COLMAP](https://colmap.github.io/) kurulu ve PATH'e eklenmiş olmalıdır.
 
-Varsayılan dinleme adresi: `config.py` içinde `0.0.0.0` ve **8765** portu. Tarayıcı: `http://<PC_IP>:8765/viewer`.
-
-**İsteğe bağlı tam pipeline**: Sistem PATH’inde [COLMAP](https://colmap.github.io/).
-
-### Unity (Quest)
-
-- Unity sürümü projenin `ProjectVersion.txt` ile uyumlu olmalıdır.
-- **Meta XR** paketleri; derlemede **`META_XR_SDK`** scripting define grubu aktif olmalıdır (`DepthCapture`, `MRSetup`, vb. için).
-- `SceneBootstrapper` içeren sahne; Android manifests’te internet ve headset kamera izinleri (`SceneBootstrapper.LogPermissions()` referansı).
-
-PC ve Quest **aynı ağda** olmalı; güvenlik duvarında **8765** TCP dinlemesine izin verin.
+### 2. Unity (Quest) İstemcisini Derleme
+* Unity Hub üzerinden `QuestScanner` klasörünü açın.
+* Build Settings'ten platformu **Android** olarak seçin ve Texture Compression'ı **ASTC** yapın.
+* **Player Settings -> Scripting Define Symbols** kısmına `META_XR_SDK` tanımını ekleyin.
+* Headset'i bilgisayara bağlayıp derleyin ve yükleyin (Build and Run).
+* Quest uygulamasını açtığınızda sol elinizdeki menüden bilgisayarınızın yerel IP adresini girip **Connect** tuşuna basarak taramayı başlatabilirsiniz.
 
 ---
 
-## Bağımlılıklar (`server/requirements.txt`)
+## Görüntü İşleme ve Bilgisayarlı Görü Kavram Eşleştirmesi
 
-- **fastapi**, **uvicorn**, **websockets**: HTTP/WebSocket sunucusu
-- **opencv-python-headless**, **numpy**, **Pillow**: görüntü çözümleme ve işleme
-- **open3d**, **trimesh**: TSDF ve mesh export
-- **aiofiles**, **python-multipart**: yardımcı
+Bu proje kapsamında uygulanan temel akademik konseptler şunlardır:
 
----
-
-## Görüntü İşleme Dersi İçin Kavram Haritası
-
-| Konu | Projede karşılığı |
-|------|-------------------|
-| Görüntü temsili (RGB, gri) | OpenCV BGR matrisi, Laplacian için gri dönüşüm |
-| Kenar/odak (bulanıklık) | Laplacian varyansı eşiklemesi |
-| Parlaklık/pozlama | Ortalama gri seviye eşikleri |
-| Kamera modeli | Pinhole fx, fy, cx, cy; COLMAP PINHOLE |
-| Çok görünümlü geometri | Çoklu kare + poz; SfM (COLMAP) veya derinlik füzyonu (TSDF) |
-| Derinlik sensörü | Quest environment depth → mm’ye ölçekleme |
-| Sıkıştırma | JPEG (istemci ve sunucu tarafı) |
-
----
-
-## Bilinen Sınırlamalar / Notlar
-
-- **CameraCapture** birincil olarak **RenderTexture + center eye camera** ile yakalar; gerçek passthrough sensörü için Meta Camera Access API entegrasyonu kodda yorum olarak bırakılmıştır.
-- **DepthCapture** global `_EnvironmentDepthTexture` varlığına bağlıdır; yoksa derinlik boş gider ve sunucu **sadece renk + poz** ile sınırlı yolları kullanır.
-- **MIN_OVERLAP_RATIO** `config.py`’de tanımlıdır; mevcut `FrameHandler` akışında **ardışık kare örtüşme kontrolü uygulanmıyor** — ileri geliştirme için uygun bir kanca.
-- WebSocket istemcisi `SendAsync`’i beklemeden gönderir; yoğun ağda kuyruk ve geri baskı iyileştirilebilir.
-
----
-
-## Özet
-
-**MetaScan**, VR tarafında **durum yönetimi, MR passthrough, el tabanlı UI ve çok modlu veri** (renk, derinlik, poz) üretir; sunucu tarafında **klasik CV kalite filtreleri** ve **COLMAP / Open3D** ile **3D mesh** üretimine köprü kurar. Bu README, ders raporunda mimari, veri akışı ve görüntü işleme bileşenlerini tek yerden referans almanız için yazılmıştır.
+* **Laplacian Varyansı ile Bulanıklık Analizi:** `frame_handler.py` içinde `cv2.Laplacian` filtresi kullanılarak her kare için kenar keskinliği ölçülür. Belirlenen eşik değerinin altındaki (hareketten dolayı bulanık çıkmış) kareler doğrudan elenir.
+* **Histogram ve Ortalama Parlaklık Analizi (Exposure):** Görüntü matrisinin gri tonlama seviyesi (0-255) incelenerek aşırı karanlık veya aşırı patlamış ışıklı sahneler elenir.
+* **Pinhole Kamera Modeli ve Kalibrasyon:** Başlıktan alınan projeksiyon matrisinin odak uzaklığı ($f_x, f_y$) ve optik merkez ($c_x, c_y$) bileşenlerine dönüştürülerek 2D piksel koordinatları ile 3D dünya koordinatları arasındaki izdüşüm kurulur.
+* **TSDF (Truncated Signed Distance Function) Fusion:** Open3D kullanılarak derinlik haritaları ve kamera dış parametreleri (poz verileri) 3D hacimsel alanda birleştirilir ve yüzey mesh'i (Marching Cubes algoritması benzeri bir mantıkla) oluşturulur.
+* **Aykırı Değer Filtreleme (Outlier Removal):** Nokta bulutundaki gürültüleri temizlemek için istatistiksel uzaklık analizi uygulanmıştır.

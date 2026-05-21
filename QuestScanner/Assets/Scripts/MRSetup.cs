@@ -20,6 +20,14 @@ namespace MetaScan
 
         private void ConfigurePassthrough()
         {
+#if UNITY_ANDROID && !UNITY_EDITOR
+            // Request Scene permission explicitly at startup for Depth sensor
+            if (!UnityEngine.Android.Permission.HasUserAuthorizedPermission("com.oculus.permission.USE_SCENE"))
+            {
+                UnityEngine.Android.Permission.RequestUserPermission("com.oculus.permission.USE_SCENE");
+            }
+#endif
+
 #if META_XR_SDK
             // Configure OVRManager for passthrough
             OVRManager ovrManager = FindFirstObjectByType<OVRManager>();

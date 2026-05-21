@@ -41,6 +41,12 @@ namespace MetaScan
         private float principalPointX = 640f;
         private float principalPointY = 480f;
 
+        // Public accessors for intrinsics (ScanManager → PointCloudVisualizer deprojection)
+        public float FocalLengthX => focalLengthX;
+        public float FocalLengthY => focalLengthY;
+        public float PrincipalPointX => principalPointX;
+        public float PrincipalPointY => principalPointY;
+
 #if META_XR_SDK
         // Official Meta Passthrough Camera Access API
         private PassthroughCameraAccess mrukCameraAccess;

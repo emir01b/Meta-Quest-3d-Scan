@@ -103,17 +103,24 @@ class ReconstructionPipeline:
                 "--image_path", str(colmap_images_dir),
                 "--ImageReader.single_camera", "1",
                 "--ImageReader.camera_model", "PINHOLE",
+                # ── Enhanced SIFT for low-contrast passthrough images ──
+                "--SiftExtraction.max_num_features", "8192",
+                "--SiftExtraction.first_octave", "-1",        # Sub-pixel features
+                "--SiftExtraction.peak_threshold", "0.004",   # Lower peak threshold → more features
+                "--SiftExtraction.edge_threshold", "16",      # Allow weaker edge features
+                "--SiftExtraction.domain_size_pooling", "1",  # Better descriptor quality
             ]
             if camera_params and COLMAP_FIX_INTRINSICS:
                 feat_cmd += ["--ImageReader.camera_params", camera_params]
             subprocess.run(feat_cmd, check=True, capture_output=True, timeout=600)
 
-            # ── Step 2: Feature matching ──
-            logger.info("COLMAP: Feature matching...")
+            # ── Step 2: Feature matching (exhaustive for better coverage) ──
+            logger.info("COLMAP: Exhaustive feature matching...")
             subprocess.run([
-                colmap_path, "sequential_matcher",
+                colmap_path, "exhaustive_matcher",
                 "--database_path", str(colmap_db),
-            ], check=True, capture_output=True, timeout=600)
+                "--ExhaustiveMatching.block_size", "50",
+            ], check=True, capture_output=True, timeout=1200)
 
             # ── Step 3: Reconstruction ──
             known_model_dir = self.colmap_dir  # Contains cameras.txt, images.txt, points3D.txt
@@ -196,6 +203,59 @@ class ReconstructionPipeline:
             except Exception as e:
                 logger.warning(f"Failed to export COLMAP PLY: {e}")
 
+            # ── Dense reconstruction: undistort → patch_match → fusion ──
+            try:
+                # Find the sparse model directory (mapper uses 0/, triangulator uses sparse/)
+                sparse_model_dir = colmap_sparse / "0"
+                if not sparse_model_dir.exists():
+                    sparse_model_dir = colmap_sparse
+
+                # Step A: Undistort images
+                logger.info("COLMAP: Undistorting images for dense reconstruction...")
+                subprocess.run([
+                    colmap_path, "image_undistorter",
+                    "--image_path", str(colmap_images_dir),
+                    "--input_path", str(sparse_model_dir),
+                    "--output_path", str(colmap_dense),
+                    "--output_type", "COLMAP",
+                ], check=True, capture_output=True, timeout=300)
+
+                # Step B: Stereo matching (depth estimation per image pair)
+                logger.info("COLMAP: Patch match stereo (dense depth estimation)...")
+                patch_cmd = [
+                    colmap_path, "patch_match_stereo",
+                    "--workspace_path", str(colmap_dense),
+                    "--workspace_format", "COLMAP",
+                    "--PatchMatchStereo.geom_consistency", "true",
+                    "--PatchMatchStereo.max_image_size", "1280",
+                ]
+                # Try GPU first, fall back to CPU-compatible settings
+                subprocess.run(patch_cmd, check=True, capture_output=True, timeout=1800)
+
+                # Step C: Stereo fusion (merge depth maps into dense point cloud)
+                dense_ply_path = colmap_dense / "fused.ply"
+                logger.info("COLMAP: Stereo fusion (merging depth maps)...")
+                subprocess.run([
+                    colmap_path, "stereo_fusion",
+                    "--workspace_path", str(colmap_dense),
+                    "--workspace_format", "COLMAP",
+                    "--output_path", str(dense_ply_path),
+                    "--StereoFusion.min_num_pixels", "3",
+                ], check=True, capture_output=True, timeout=600)
+
+                if dense_ply_path.exists() and dense_ply_path.stat().st_size > 1000:
+                    logger.info(f"COLMAP: Dense point cloud created: {dense_ply_path}")
+                else:
+                    logger.warning("COLMAP: Dense fusion produced empty or tiny output")
+
+            except subprocess.CalledProcessError as e:
+                stderr_text = e.stderr.decode('utf-8', errors='replace') if e.stderr else ''
+                logger.warning(f"COLMAP dense reconstruction failed: {e}. stderr: {stderr_text[:500]}")
+            except subprocess.TimeoutExpired:
+                logger.warning("COLMAP dense reconstruction timed out")
+            except Exception as e:
+                logger.warning(f"COLMAP dense reconstruction error: {e}")
+
             logger.info("COLMAP: Sparse reconstruction completed")
             return True
 
@@ -243,27 +303,67 @@ class ReconstructionPipeline:
         # Check if we have depth maps
         depth_files = list(self.depth_dir.glob("depth_*.raw"))
         if len(depth_files) == 0:
-            logger.info("No depth maps available. Checking for COLMAP fallback.")
+            logger.info("No depth maps available. Checking for COLMAP reconstruction.")
             
-            # Check if COLMAP successfully created a PLY
+            # Check dense PLY first (much better quality)
+            dense_ply = self.colmap_dir / "workspace" / "dense" / "fused.ply"
             colmap_ply = self.colmap_dir / "workspace" / "model.ply"
-            if colmap_ply.exists():
+            
+            ply_to_use = None
+            if dense_ply.exists() and dense_ply.stat().st_size > 1000:
+                ply_to_use = dense_ply
+                logger.info("Using COLMAP dense point cloud (fused.ply)")
+            elif colmap_ply.exists():
+                ply_to_use = colmap_ply
+                logger.info("Using COLMAP sparse point cloud (model.ply)")
+            
+            if ply_to_use is not None:
                 try:
-                    logger.info("Loading COLMAP reconstructed point cloud...")
-                    pcd = o3d.io.read_point_cloud(str(colmap_ply))
+                    pcd = o3d.io.read_point_cloud(str(ply_to_use))
+                    logger.info(f"Loaded point cloud: {len(pcd.points)} points")
                     
-                    # COLMAP point_triangulator sometimes exports pitch-black colors
+                    # COLMAP sometimes exports pitch-black colors
                     if pcd.has_colors():
-                        import numpy as np
                         if np.mean(np.asarray(pcd.colors)) < 0.01:
                             logger.info("Stripping black colors to allow viewer fallback color.")
                             pcd.colors = o3d.utility.Vector3dVector()
                             
-                    # Remove crazy outliers that blow up the bounding box
-                    logger.info(f"Removing outliers from {len(pcd.points)} points...")
-                    pcd, ind = pcd.remove_statistical_outlier(nb_neighbors=50, std_ratio=1.0)
-                    logger.info(f"Cleaned point cloud has {len(pcd.points)} points.")
+                    # Remove outliers
+                    if len(pcd.points) > 100:
+                        logger.info(f"Removing outliers from {len(pcd.points)} points...")
+                        nb = min(50, max(10, len(pcd.points) // 20))
+                        pcd, ind = pcd.remove_statistical_outlier(nb_neighbors=nb, std_ratio=1.5)
+                        logger.info(f"Cleaned point cloud has {len(pcd.points)} points.")
+                    
+                    # Try Poisson surface reconstruction if we have enough points
+                    if len(pcd.points) > 5000:
+                        try:
+                            logger.info("Attempting Poisson surface reconstruction...")
+                            # Estimate normals
+                            pcd.estimate_normals(
+                                search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.02, max_nn=30)
+                            )
+                            pcd.orient_normals_consistent_tangent_plane(k=15)
                             
+                            mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+                                pcd, depth=9, width=0, scale=1.1, linear_fit=False
+                            )
+                            
+                            # Remove low-density vertices (noise)
+                            densities_np = np.asarray(densities)
+                            density_threshold = np.quantile(densities_np, 0.05)
+                            vertices_to_remove = densities_np < density_threshold
+                            mesh.remove_vertices_by_mask(vertices_to_remove)
+                            mesh.compute_vertex_normals()
+                            
+                            if len(mesh.triangles) > 100:
+                                logger.info(f"Poisson mesh: {len(mesh.vertices)} vertices, {len(mesh.triangles)} faces")
+                                return mesh
+                            else:
+                                logger.warning("Poisson mesh too sparse, returning point cloud")
+                        except Exception as e:
+                            logger.warning(f"Poisson reconstruction failed: {e}")
+                    
                     return pcd
                 except Exception as e:
                     logger.warning(f"Failed to load COLMAP PLY: {e}")

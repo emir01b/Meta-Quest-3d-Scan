@@ -34,7 +34,7 @@ CAMERA_FPS = 30
 # =============================================================================
 # Frame Quality Thresholds
 # =============================================================================
-BLUR_THRESHOLD = 100.0        # Laplacian variance — below = blurry
+BLUR_THRESHOLD = 15.0         # Laplacian variance — passthrough cameras have lower sharpness
 EXPOSURE_MIN = 30             # Mean pixel value min
 EXPOSURE_MAX = 230            # Mean pixel value max
 MIN_OVERLAP_RATIO = 0.3       # Minimum overlap between consecutive frames
@@ -46,7 +46,7 @@ MIN_FRAMES_FOR_RECONSTRUCTION = 20
 MAX_FRAMES_FOR_RECONSTRUCTION = 500
 
 # COLMAP parameters
-COLMAP_BINARY = r"C:\Users\stnm\Desktop\COLMAP\COLMAP.bat"
+COLMAP_BINARY = r"C:\Users\enesb\Desktop\proje\emirhan\colmap-x64-windows-cuda\COLMAP.bat"
 COLMAP_CAMERA_MODEL = "PINHOLE"
 COLMAP_MATCHER = "sequential"
 COLMAP_MAX_IMAGE_SIZE = 1280

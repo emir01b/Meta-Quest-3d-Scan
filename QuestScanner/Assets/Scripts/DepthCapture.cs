@@ -87,26 +87,27 @@ namespace MetaScan
 #if META_XR_SDK
         private byte[] CaptureDepthOVR()
         {
-            // Current Meta XR SDK uses EnvironmentDepthManager for depth access.
-            // The depth texture is rendered automatically via the OVR compositor.
-            // Direct pixel readback is not supported through the old API.
-            // For scanning, we rely on camera frames + pose data primarily.
-            // Depth data will be available when EnvironmentDepthManager is in the scene.
-
             // Try to find the global depth texture set by the SDK
             Texture depthTex = Shader.GetGlobalTexture("_EnvironmentDepthTexture");
-            if (depthTex == null || !(depthTex is RenderTexture depthRT))
+            if (depthTex == null)
             {
                 return new byte[0];
             }
 
-            DepthWidth = depthRT.width;
-            DepthHeight = depthRT.height;
+            DepthWidth = depthTex.width;
+            DepthHeight = depthTex.height;
 
-            // Read depth texture
+            // Create a temporary readable RenderTexture (RFloat)
+            // Depth map reading requires blitting to a color texture first on Android/Quest
+            RenderTexture tempRT = RenderTexture.GetTemporary(DepthWidth, DepthHeight, 0, RenderTextureFormat.RFloat, RenderTextureReadWrite.Linear);
+            
+            // Blit depth texture to our temporary RT
+            Graphics.Blit(depthTex, tempRT);
+
+            // Read pixels from the RT
             Texture2D readTex = new Texture2D(DepthWidth, DepthHeight, TextureFormat.RFloat, false);
             RenderTexture prevActive = RenderTexture.active;
-            RenderTexture.active = depthRT;
+            RenderTexture.active = tempRT;
             readTex.ReadPixels(new Rect(0, 0, DepthWidth, DepthHeight), 0, 0);
             readTex.Apply();
             RenderTexture.active = prevActive;
@@ -122,7 +123,9 @@ namespace MetaScan
                 depthBytes[i * 2 + 1] = (byte)((depthMM >> 8) & 0xFF);
             }
 
+            // Cleanup memory
             Object.Destroy(readTex);
+            RenderTexture.ReleaseTemporary(tempRT);
 
             lastDepthData = depthBytes;
             lastDepthTime = Time.time;

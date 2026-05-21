@@ -95,6 +95,9 @@ class FrameHandler:
                 quality_ok = True
                 quality_issues = []
 
+            # ── Image preprocessing for better COLMAP features ──
+            image = self._preprocess_image(image)
+
             # Save image
             img_filename = f"frame_{self.accepted_frames:06d}.jpg"
             img_path = self.images_dir / img_filename
@@ -234,6 +237,41 @@ class FrameHandler:
 
         quality_ok = len(issues) == 0
         return quality_ok, issues
+
+    def _preprocess_image(self, image: np.ndarray) -> np.ndarray:
+        """
+        Preprocess image for better COLMAP feature extraction.
+        Applies CLAHE contrast enhancement, denoising, and sharpening.
+        """
+        try:
+            # 1. Convert to LAB color space for CLAHE on luminance only
+            lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+            l_channel, a_channel, b_channel = cv2.split(lab)
+
+            # 2. CLAHE — Adaptive contrast enhancement
+            #    clipLimit=3.0: moderate contrast boost without over-amplifying noise
+            #    tileGridSize=(8,8): 8x8 tiles for local adaptation
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+            l_enhanced = clahe.apply(l_channel)
+
+            # 3. Merge back and convert to BGR
+            lab_enhanced = cv2.merge([l_enhanced, a_channel, b_channel])
+            enhanced = cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2BGR)
+
+            # 4. Bilateral filter — reduce noise while preserving edges
+            #    d=5: small neighborhood (fast), sigmaColor=50, sigmaSpace=50
+            denoised = cv2.bilateralFilter(enhanced, d=5, sigmaColor=50, sigmaSpace=50)
+
+            # 5. Unsharp mask — sharpen for better feature detection
+            #    Gaussian blur → subtract from original → add scaled difference
+            gaussian = cv2.GaussianBlur(denoised, (0, 0), sigmaX=2.0)
+            sharpened = cv2.addWeighted(denoised, 1.5, gaussian, -0.5, 0)
+
+            return sharpened
+
+        except Exception as e:
+            logger.warning(f"Image preprocessing failed: {e}. Using original.")
+            return image
 
     def _parse_pose(self, pose_data: bytes) -> dict | None:
         """Parse 6DoF pose from bytes (position + quaternion)."""

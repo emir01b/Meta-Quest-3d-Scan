@@ -348,14 +348,52 @@ namespace MetaScan
         {
             if (pointCloudVisualizer == null || headTransform == null) return;
 
-            float hitDist = 0f;
-            if (scanPointer != null && scanPointer.HasHit)
-                hitDist = scanPointer.GetHitDistance();
+            // Önce gerçek depth verisi ile dene
+            bool usedRealDepth = false;
 
-            pointCloudVisualizer.AddFramePoints(
-                headTransform.position, headTransform.forward,
-                headTransform.right, headTransform.up,
-                qualityOk, hitDist);
+            if (depthCapture != null && depthCapture.IsDepthAvailable
+                && depthCapture.DepthWidth > 0 && depthCapture.DepthHeight > 0)
+            {
+                byte[] depthData = depthCapture.GetLastDepthData();
+                if (depthData != null && depthData.Length > 0 && cameraCapture != null)
+                {
+                    // Intrinsics'i al (CameraCapture'dan)
+                    float fx = cameraCapture.FocalLengthX;
+                    float fy = cameraCapture.FocalLengthY;
+                    float cx = cameraCapture.PrincipalPointX;
+                    float cy = cameraCapture.PrincipalPointY;
+
+                    // Depth boyutlarına göre intrinsics'i ölçekle
+                    // (CameraCapture intrinsics captureWidth/Height'a göre,
+                    //  ama depth farklı çözünürlükte olabilir)
+                    float scaleX = (float)depthCapture.DepthWidth / 1280f;
+                    float scaleY = (float)depthCapture.DepthHeight / 960f;
+
+                    pointCloudVisualizer.AddDepthPoints(
+                        depthData,
+                        depthCapture.DepthWidth,
+                        depthCapture.DepthHeight,
+                        fx * scaleX, fy * scaleY,
+                        cx * scaleX, cy * scaleY,
+                        headTransform.position,
+                        headTransform.rotation
+                    );
+                    usedRealDepth = true;
+                }
+            }
+
+            // Depth yoksa fallback: rastgele saçılım
+            if (!usedRealDepth)
+            {
+                float hitDist = 0f;
+                if (scanPointer != null && scanPointer.HasHit)
+                    hitDist = scanPointer.GetHitDistance();
+
+                pointCloudVisualizer.AddFramePoints(
+                    headTransform.position, headTransform.forward,
+                    headTransform.right, headTransform.up,
+                    qualityOk, hitDist);
+            }
         }
 
         // ================== Update ==================

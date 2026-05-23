@@ -296,6 +296,38 @@
             </div>
         </div>
 
+        <!-- Reconstruction Settings -->
+        <div class="section" id="reconSection" style="display:none;">
+            <h3>Reconstruction (COLMAP)</h3>
+            <div class="ctrl">
+                <label>Kalite Ayarı</label>
+                <select id="reconQuality" class="btn btn-sm btn-full" style="background:var(--bg-card); color:var(--text); text-align:left; border:1px solid var(--border);">
+                    <option value="low">Low (Çok Hızlı, Düşük Çözünürlük)</option>
+                    <option value="medium" selected>Medium (Dengeli)</option>
+                    <option value="high">High (Detaylı, Yavaş)</option>
+                    <option value="extreme">Extreme (Orijinal Çözünürlük, Çok Yavaş)</option>
+                </select>
+            </div>
+            <div class="ctrl" style="margin-top:10px;">
+                <label>Çıktı Klasörü (Opsiyonel)</label>
+                <input type="text" id="reconOutputDir" class="btn btn-sm btn-full" placeholder="C:\Custom\Output\Dir" style="background:var(--bg-card); color:var(--text); text-align:left; border:1px solid var(--border); padding-left:10px;">
+            </div>
+            
+            <div id="reconProgressContainer" style="display:none; margin-top:12px;">
+                <div style="font-size:11px; margin-bottom:4px; display:flex; justify-content:space-between;">
+                    <span id="reconStatusText" style="color:var(--accent-light);">Hazırlanıyor...</span>
+                    <span id="reconPercent">0%</span>
+                </div>
+                <div style="width:100%; background:var(--bg-card); height:6px; border-radius:3px; overflow:hidden;">
+                    <div id="reconProgressBar" style="width:0%; background:var(--gradient); height:100%; transition:width 0.3s;"></div>
+                </div>
+            </div>
+
+            <div class="btn-group" style="margin-top:10px;" id="reconBtnGroup">
+                <button class="btn btn-primary btn-full" onclick="startReconstructionCustom()">🚀 İşlemi Başlat</button>
+            </div>
+        </div>
+
         <!-- Export -->
         <div class="section" id="exportSection" style="display:none;">
             <h3>Disa Aktar</h3>
@@ -362,7 +394,7 @@
         renderer.shadowMap.enabled = true;
         renderer.shadowMap.type = THREE.PCFSoftShadowMap;
         renderer.toneMapping = THREE.ACESFilmicToneMapping;
-        renderer.toneMappingExposure = 1.2;
+        renderer.toneMappingExposure = 1.5;
         renderer.outputColorSpace = THREE.SRGBColorSpace;
 
         const controls = new THREE.OrbitControls(camera, canvas);
@@ -374,18 +406,18 @@
         controls.autoRotateSpeed = 2.0;
 
         // Lighting
-        scene.add(new THREE.AmbientLight(0x404060, 0.8));
+        scene.add(new THREE.AmbientLight(0xffffff, 1.0));
 
         const dl1 = new THREE.DirectionalLight(0xffffff, 1.5);
         dl1.position.set(5, 8, 5);
         dl1.castShadow = true;
         scene.add(dl1);
 
-        const dl2 = new THREE.DirectionalLight(0x8888ff, 0.6);
+        const dl2 = new THREE.DirectionalLight(0xddeeff, 0.8);
         dl2.position.set(-5, 3, -5);
         scene.add(dl2);
 
-        scene.add(new THREE.HemisphereLight(0x6366f1, 0x1a1a28, 0.4));
+        scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 0.6));
 
         const gridHelper = new THREE.GridHelper(10, 20, 0x2a2a4a, 0x1a1a2e);
         gridHelper.visible = false;
@@ -448,7 +480,7 @@
                 if (c.isMesh) {
                     if (!c.material || c.material.type === 'MeshBasicMaterial') {
                         c.material = new THREE.MeshStandardMaterial({
-                            color: 0x8888cc, roughness: 0.5, metalness: 0.1,
+                            color: 0xffffff, roughness: 0.5, metalness: 0.1,
                         });
                     }
                     c.castShadow = true;
@@ -485,7 +517,6 @@
             document.getElementById('loadingOverlay').classList.add('hidden');
 
             setRenderMode(currentRenderMode);
-            showExportButtons();
             toast(`✅ Model yüklendi: ${fmtNum(verts)} vertex`, 'success');
         }
 
@@ -696,10 +727,18 @@
             }
         }
 
+        let activeSessionId = null;
+
         async function selectSession(id) {
+            activeSessionId = id;
             document.querySelectorAll('.session').forEach(s => s.classList.remove('active'));
             const el = document.getElementById('session-' + id);
             if (el) el.classList.add('active');
+
+            // Show reconstruction UI
+            document.getElementById('reconSection').style.display = 'block';
+            document.getElementById('reconProgressContainer').style.display = 'none';
+            document.getElementById('reconBtnGroup').style.display = 'flex';
 
             try {
                 const res = await fetch(API + '/api/sessions/' + id + '/exports');
@@ -715,50 +754,116 @@
                     const sec = document.getElementById('exportSection');
                     const btns = document.getElementById('exportBtns');
                     sec.style.display = 'block';
-                    btns.innerHTML = data.exports.map(e =>
-                        `<a class="btn btn-sm" href="${API}${e.url}" download>📥 ${e.format} (${e.size_mb}MB)</a>`
-                    ).join('');
+                    btns.style.display = 'flex';
+                    btns.style.flexDirection = 'column';
+                    btns.style.gap = '6px';
+
+                    btns.innerHTML = data.exports.map(e => {
+                        const ext = e.filename.split('.').pop().toLowerCase();
+                        return `<div style="display:flex;gap:4px;width:100%;">
+                            <button class="btn btn-sm btn-primary" style="flex:1; justify-content:flex-start;" onclick="loadFromURL('${API}${e.url}', '${ext}')">👁️ ${e.format}</button>
+                            <a class="btn btn-sm" style="width:36px; padding:0; display:flex; align-items:center; justify-content:center;" href="${API}${e.url}" download title="İndir">📥</a>
+                        </div>`;
+                    }).join('');
                 } else {
                     toast('⚠️ Bu oturum için henüz export yok. Reconstruction başlatın.', 'warning');
-
-                    // Offer reconstruction
                     const sec = document.getElementById('exportSection');
-                    const btns = document.getElementById('exportBtns');
-                    sec.style.display = 'block';
-                    btns.innerHTML = `<button class="btn btn-primary btn-full" onclick="startReconstruction('${id}')">🔧 3D Model Oluştur</button>`;
+                    sec.style.display = 'none';
                 }
+
+                // Check if reconstruction is running
+                pollReconstruction(id, true);
+
             } catch (e) {
                 toast('❌ Oturum bilgileri alınamadı', 'error');
             }
         }
 
-        async function startReconstruction(id) {
+        async function startReconstructionCustom() {
+            if (!activeSessionId) return;
+            const quality = document.getElementById('reconQuality').value || 'medium';
+            let outputDir = document.getElementById('reconOutputDir').value || '';
+            
+            // Build url with query params
+            let url = `${API}/api/sessions/${activeSessionId}/reconstruct?method=full&quality=${quality}`;
+            if (outputDir.trim() !== '') {
+                url += `&output_dir=${encodeURIComponent(outputDir)}`;
+            }
+
             try {
-                await fetch(API + '/api/sessions/' + id + '/reconstruct?method=full', { method: 'POST' });
+                await fetch(url, { method: 'POST' });
                 toast('🔧 Reconstruction başlatıldı...', 'info');
-                pollReconstruction(id);
+                
+                document.getElementById('reconBtnGroup').style.display = 'none';
+                document.getElementById('reconProgressContainer').style.display = 'block';
+                document.getElementById('reconProgressBar').style.width = '0%';
+                document.getElementById('reconPercent').textContent = '0%';
+                document.getElementById('reconStatusText').textContent = 'Başlatılıyor...';
+
+                pollReconstruction(activeSessionId);
             } catch (e) {
                 toast('❌ Reconstruction başlatılamadı', 'error');
             }
         }
 
-        async function pollReconstruction(id) {
+        // Maintain compatibility with old function just in case
+        async function startReconstruction(id) {
+            activeSessionId = id;
+            startReconstructionCustom();
+        }
+
+        async function pollReconstruction(id, initialCheck = false) {
             const check = async () => {
+                if (id !== activeSessionId) return; // session changed
                 try {
                     const res = await fetch(API + '/api/sessions/' + id + '/reconstruction/status');
                     const data = await res.json();
 
-                    if (data.status === 'completed') {
-                        toast('✅ 3D model oluşturuldu!', 'success');
-                        selectSession(id);
-                    } else if (data.status === 'failed') {
-                        toast('❌ Reconstruction başarısız: ' + (data.error || ''), 'error');
+                    if (data.status === 'not_started') {
+                        if (!initialCheck) {
+                            document.getElementById('reconBtnGroup').style.display = 'flex';
+                            document.getElementById('reconProgressContainer').style.display = 'none';
+                        }
                     } else if (data.status === 'running') {
-                        setTimeout(check, 3000);
+                        document.getElementById('reconBtnGroup').style.display = 'none';
+                        document.getElementById('reconProgressContainer').style.display = 'block';
+                        
+                        let prog = data.progress || 0;
+                        let step = data.step || 'İşleniyor...';
+                        
+                        document.getElementById('reconProgressBar').style.width = prog + '%';
+                        document.getElementById('reconPercent').textContent = prog + '%';
+                        document.getElementById('reconStatusText').textContent = step;
+
+                        setTimeout(check, 1000);
+                    } else if (data.status === 'completed') {
+                        if (!initialCheck) {
+                            document.getElementById('reconProgressBar').style.width = '100%';
+                            document.getElementById('reconPercent').textContent = '100%';
+                            document.getElementById('reconStatusText').textContent = 'Tamamlandı';
+                            toast('✅ 3D model oluşturuldu!', 'success');
+                            setTimeout(() => {
+                                document.getElementById('reconBtnGroup').style.display = 'flex';
+                                document.getElementById('reconProgressContainer').style.display = 'none';
+                                selectSession(id); // reload exports
+                            }, 2000);
+                        }
+                    } else if (data.status === 'failed') {
+                        if (!initialCheck) {
+                            document.getElementById('reconStatusText').textContent = 'Hata oluştu!';
+                            toast('❌ Reconstruction başarısız: ' + (data.error || ''), 'error');
+                            document.getElementById('reconBtnGroup').style.display = 'flex';
+                        }
                     }
-                } catch (e) { /* ignore polling errors */ }
+                } catch (e) { 
+                    if (!initialCheck) setTimeout(check, 3000);
+                }
             };
-            setTimeout(check, 3000);
+            if (initialCheck) {
+                check();
+            } else {
+                setTimeout(check, 1000);
+            }
         }
 
         // =================================================================

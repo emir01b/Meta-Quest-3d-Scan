@@ -34,6 +34,7 @@ logger = logging.getLogger("metascan.server")
 # Active sessions
 active_sessions: dict[str, dict] = {}
 reconstruction_tasks: dict[str, asyncio.Task] = {}
+reconstruction_progress: dict[str, dict] = {}
 
 
 @asynccontextmanager
@@ -137,10 +138,12 @@ async def get_session(session_id: str):
 
 
 @app.post("/api/sessions/{session_id}/reconstruct")
-async def start_reconstruction(session_id: str, method: str = "full"):
+async def start_reconstruction(session_id: str, method: str = "full", quality: str = "medium", output_dir: str = None):
     """
     Start 3D reconstruction for a session.
     method: 'colmap', 'full' (both), or 'tsdf' (depth-only fallback)
+    quality: 'low', 'medium', 'high'
+    output_dir: Custom output directory path (optional)
     """
     session_dir = SESSIONS_DIR / session_id
     if not session_dir.exists():
@@ -151,22 +154,29 @@ async def start_reconstruction(session_id: str, method: str = "full"):
         if not task.done():
             return {"status": "already_running", "session_id": session_id}
 
+    reconstruction_progress[session_id] = {"progress": 0, "step": "Starting"}
+
+    def progress_callback(progress: int, step: str):
+        reconstruction_progress[session_id] = {"progress": progress, "step": step}
+
     async def run_reconstruction():
         loop = asyncio.get_event_loop()
-        pipeline = ReconstructionPipeline(session_dir, session_id)
+        
+        custom_out_path = Path(output_dir) if output_dir else None
+        pipeline = ReconstructionPipeline(session_dir, session_id, custom_out_path)
 
         if method == "tsdf":
             result = await loop.run_in_executor(
                 None, SimpleReconstruction.reconstruct_from_depth_maps,
-                session_dir, session_id,
+                session_dir, session_id, custom_out_path, progress_callback
             )
         elif method == "colmap":
             result = await loop.run_in_executor(
-                None, pipeline.run_colmap_pipeline, True,
+                None, pipeline.run_colmap_pipeline, True, quality, progress_callback
             )
         else:  # full
             result = await loop.run_in_executor(
-                None, pipeline.run_full_pipeline, True,
+                None, pipeline.run_full_pipeline, True, quality, progress_callback
             )
 
         logger.info(
@@ -178,7 +188,7 @@ async def start_reconstruction(session_id: str, method: str = "full"):
     task = asyncio.create_task(run_reconstruction())
     reconstruction_tasks[session_id] = task
 
-    return {"status": "started", "session_id": session_id, "method": method}
+    return {"status": "started", "session_id": session_id, "method": method, "quality": quality}
 
 
 @app.get("/api/sessions/{session_id}/reconstruction/status")
@@ -187,16 +197,18 @@ async def reconstruction_status(session_id: str):
     if session_id not in reconstruction_tasks:
         return {"status": "not_started"}
 
+    progress_info = reconstruction_progress.get(session_id, {"progress": 0, "step": ""})
     task = reconstruction_tasks[session_id]
+    
     if task.done():
         try:
             result = task.result()
             status = result.get("status", "completed")
-            return {"status": status, "result": result}
+            return {"status": status, "result": result, "progress": 100, "step": "Done"}
         except Exception as e:
-            return {"status": "failed", "error": str(e)}
+            return {"status": "failed", "error": str(e), "progress": progress_info["progress"], "step": "Failed"}
     else:
-        return {"status": "running"}
+        return {"status": "running", "progress": progress_info["progress"], "step": progress_info["step"]}
 
 
 @app.get("/api/sessions/{session_id}/exports")

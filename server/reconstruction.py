@@ -19,53 +19,121 @@ logger = logging.getLogger("metascan.reconstruction")
 class ReconstructionPipeline:
     """Full 3D reconstruction pipeline using COLMAP + Open3D."""
 
-    def __init__(self, session_dir: Path, session_id: str):
+    def __init__(self, session_dir: Path, session_id: str, custom_output_dir: Path = None):
         self.session_dir = session_dir
         self.session_id = session_id
         self.images_dir = session_dir / "images"
         self.depth_dir = session_dir / "depth"
         self.colmap_dir = session_dir / "colmap"
-        self.output_dir = session_dir / "output"
+        self.output_dir = custom_output_dir if custom_output_dir else session_dir / "output"
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.quality = "medium"
+        self.progress_cb = None
 
-    def run_full_pipeline(self, use_colmap: bool = True) -> dict:
+    def run_full_pipeline(self, use_colmap: bool = True, quality: str = "medium", progress_cb=None) -> dict:
         """Run the complete reconstruction pipeline."""
-        logger.info(f"Starting full pipeline for session: {self.session_id}")
+        self.quality = quality
+        self.progress_cb = progress_cb
+        
+        logger.info(f"Starting full pipeline for session: {self.session_id} (Quality: {quality})")
+        if self.progress_cb: self.progress_cb(5, "Starting Full Pipeline")
         result = {"session_id": self.session_id, "status": "started", "exports": []}
 
         try:
+            exports = []
             # Step 1: Try COLMAP if available
             colmap_success = False
             if use_colmap:
                 colmap_success = self._run_colmap()
+                
+            if colmap_success:
+                # Dışa aktar (Dense Point Cloud, vs.)
+                colmap_exports = self._export_colmap_raw()
+                exports.extend(colmap_exports)
 
             # Step 2: Depth-based reconstruction (always available)
+            if self.progress_cb: self.progress_cb(60, "Depth Reconstruction")
             mesh = self._reconstruct_from_depth()
 
             if mesh is not None:
                 # Step 3: Export to multiple formats
-                exports = self._export_mesh(mesh)
+                if self.progress_cb: self.progress_cb(80, "Exporting Models")
+                mesh_exports = self._export_mesh(mesh)
+                # Sadece yeni formatları ekle (aynı isimde dosya eklendiyse listeyi güncelle)
+                for me in mesh_exports:
+                    if not any(e["filename"] == me["filename"] for e in exports):
+                        exports.append(me)
+
+            if len(exports) > 0:
                 result["exports"] = exports
                 result["status"] = "completed"
+                if self.progress_cb: self.progress_cb(100, "Completed")
                 logger.info(f"Pipeline completed: {len(exports)} exports")
-            elif colmap_success:
-                result["status"] = "colmap_only"
             else:
                 result["status"] = "failed"
-                result["error"] = "No reconstruction method succeeded"
+                result["error"] = "No reconstruction method produced outputs"
+                if self.progress_cb: self.progress_cb(0, "Failed")
 
         except Exception as e:
             logger.error(f"Pipeline error: {e}", exc_info=True)
             result["status"] = "failed"
             result["error"] = str(e)
+            if self.progress_cb: self.progress_cb(0, "Failed")
 
         return result
+
+    def _export_colmap_raw(self) -> list[dict]:
+        """Copy COLMAP raw outputs (fused.ply, meshed-poisson.ply) to the exports directory."""
+        from config import EXPORTS_DIR
+        export_dir = EXPORTS_DIR / self.session_id
+        export_dir.mkdir(parents=True, exist_ok=True)
+        
+        exports = []
+        dense_dir = self.colmap_dir / "workspace" / "dense"
+        
+        # 1. Dense Point Cloud (fused.ply)
+        fused_path = dense_dir / "fused.ply"
+        if fused_path.exists() and fused_path.stat().st_size > 1000:
+            out_path = export_dir / f"{self.session_id}_dense_cloud.ply"
+            try:
+                shutil.copy2(str(fused_path), str(out_path))
+                exports.append({
+                    "format": "PLY (Dense Point Cloud)",
+                    "filename": out_path.name,
+                    "path": str(out_path),
+                    "size_mb": round(out_path.stat().st_size / (1024 * 1024), 2),
+                    "url": f"/exports/{self.session_id}/{out_path.name}",
+                })
+                logger.info(f"Exported COLMAP dense cloud: {out_path.name}")
+            except Exception as e:
+                logger.error(f"Failed to copy fused.ply: {e}")
+                
+        # 2. Meshed Poisson (if user or system created it via COLMAP)
+        poisson_path = dense_dir / "meshed-poisson.ply"
+        if poisson_path.exists() and poisson_path.stat().st_size > 1000:
+            out_path = export_dir / f"{self.session_id}_colmap_mesh.ply"
+            try:
+                shutil.copy2(str(poisson_path), str(out_path))
+                exports.append({
+                    "format": "PLY (COLMAP Mesh)",
+                    "filename": out_path.name,
+                    "path": str(out_path),
+                    "size_mb": round(out_path.stat().st_size / (1024 * 1024), 2),
+                    "url": f"/exports/{self.session_id}/{out_path.name}",
+                })
+                logger.info(f"Exported COLMAP poisson mesh: {out_path.name}")
+            except Exception as e:
+                logger.error(f"Failed to copy meshed-poisson.ply: {e}")
+                
+        return exports
 
     def _run_colmap(self) -> bool:
         """Run COLMAP Structure-from-Motion."""
         from config import (
             COLMAP_BINARY, COLMAP_USE_KNOWN_POSES, COLMAP_FIX_INTRINSICS
         )
+
+        if self.progress_cb: self.progress_cb(10, "Initializing COLMAP Workspace")
 
         colmap_path = shutil.which(COLMAP_BINARY)
         if colmap_path is None:
@@ -85,6 +153,28 @@ class ReconstructionPipeline:
             logger.warning("No COLMAP images found. Skipping COLMAP.")
             return False
 
+        # Quality settings mapping (matching COLMAP's internal presets)
+        if self.quality == "low":
+            sift_features = "4096"
+            feature_max_size = "1000"
+            patch_match_max_size = "1000"
+        elif self.quality == "medium":
+            sift_features = "8192"
+            feature_max_size = "2000"
+            patch_match_max_size = "2000"
+        elif self.quality == "high":
+            sift_features = "16384"
+            feature_max_size = "3200"
+            patch_match_max_size = "3200"
+        elif self.quality == "extreme":
+            sift_features = "32768"
+            feature_max_size = "-1"  # Do not resize
+            patch_match_max_size = "-1"
+        else: # Fallback
+            sift_features = "8192"
+            feature_max_size = "2000"
+            patch_match_max_size = "2000"
+
         # Load known intrinsics from session (if available)
         intrinsics_path = self.session_dir / "intrinsics.json"
         camera_params = None
@@ -95,16 +185,26 @@ class ReconstructionPipeline:
             logger.info(f"Using known intrinsics: {camera_params}")
 
         try:
+            # ── Step 0: Clean up previous runs ──
+            if colmap_db.exists():
+                logger.info("COLMAP: Cleaning up previous database...")
+                colmap_db.unlink()
+                
             # ── Step 1: Feature extraction (with known intrinsics if available) ──
             logger.info("COLMAP: Feature extraction...")
+            if self.progress_cb: self.progress_cb(15, "COLMAP: Feature Extraction")
             feat_cmd = [
                 colmap_path, "feature_extractor",
                 "--database_path", str(colmap_db),
                 "--image_path", str(colmap_images_dir),
                 "--ImageReader.single_camera", "1",
                 "--ImageReader.camera_model", "PINHOLE",
+                # ── GPU etkin ──
+                "--FeatureExtraction.use_gpu", "1",
+                # ── Quality Settings ──
+                "--FeatureExtraction.max_image_size", feature_max_size,
+                "--SiftExtraction.max_num_features", sift_features,
                 # ── Enhanced SIFT for low-contrast passthrough images ──
-                "--SiftExtraction.max_num_features", "8192",
                 "--SiftExtraction.first_octave", "-1",        # Sub-pixel features
                 "--SiftExtraction.peak_threshold", "0.004",   # Lower peak threshold → more features
                 "--SiftExtraction.edge_threshold", "16",      # Allow weaker edge features
@@ -116,70 +216,42 @@ class ReconstructionPipeline:
 
             # ── Step 2: Feature matching (exhaustive for better coverage) ──
             logger.info("COLMAP: Exhaustive feature matching...")
+            if self.progress_cb: self.progress_cb(25, "COLMAP: Feature Matching")
             subprocess.run([
                 colmap_path, "exhaustive_matcher",
                 "--database_path", str(colmap_db),
+                "--FeatureMatching.use_gpu", "1",
                 "--ExhaustiveMatching.block_size", "50",
             ], check=True, capture_output=True, timeout=1200)
 
             # ── Step 3: Reconstruction ──
+            if self.progress_cb: self.progress_cb(35, "COLMAP: Sparse Reconstruction")
             known_model_dir = self.colmap_dir  # Contains cameras.txt, images.txt, points3D.txt
             cameras_txt = known_model_dir / "cameras.txt"
             images_txt = known_model_dir / "images.txt"
 
-            if COLMAP_USE_KNOWN_POSES and cameras_txt.exists() and images_txt.exists():
-                # ── 3a: Convert text model to binary (required by point_triangulator) ──
-                bin_model_dir = colmap_workspace / "known_model_bin"
-                bin_model_dir.mkdir(exist_ok=True)
-                logger.info("COLMAP: Converting text model to binary...")
-                subprocess.run([
-                    colmap_path, "model_converter",
-                    "--input_path", str(known_model_dir),
-                    "--output_path", str(bin_model_dir),
-                    "--output_type", "BIN",
-                ], check=True, capture_output=True, timeout=120)
+            # Quest'ten gelen pose'ları (known poses) şimdilik zorla devre dışı bırakıyoruz.
+            # Çünkü manuel COLMAP kullanımında sorun çıkmıyorken, buradaki "known poses" bin dosyası GPU mapper'ı çökertiyor olabilir.
+            USE_KNOWN_POSES_TEMP = False
 
-                reconstruction_success = False
-                # ── 3b: point_triangulator — keeps Quest IMU poses fixed ──
+            if USE_KNOWN_POSES_TEMP and COLMAP_USE_KNOWN_POSES and cameras_txt.exists() and images_txt.exists():
+                pass # Bu blok şimdilik atlandı.
+            else:
+                # ── No known poses — full mapper from scratch ──
+                logger.info("COLMAP: Mapper from scratch (no known poses)...")
                 try:
-                    logger.info("COLMAP: Point triangulation with known poses...")
                     subprocess.run([
-                        colmap_path, "point_triangulator",
-                        "--database_path", str(colmap_db),
-                        "--image_path", str(colmap_images_dir),
-                        "--input_path", str(bin_model_dir),
-                        "--output_path", str(colmap_sparse),
-                    ], check=True, capture_output=True, timeout=1200)
-                    logger.info("COLMAP: Point triangulation completed (poses fixed)")
-                    reconstruction_success = True
-                except subprocess.CalledProcessError as e:
-                    logger.warning(f"point_triangulator failed: {e}. Falling back to mapper.")
-
-                if not reconstruction_success:
-                    # ── 3c: Fallback — mapper with known poses as initialization ──
-                    logger.info("COLMAP: Mapper with known poses as prior...")
-                    mapper_cmd = [
                         colmap_path, "mapper",
                         "--database_path", str(colmap_db),
                         "--image_path", str(colmap_images_dir),
                         "--output_path", str(colmap_sparse),
-                        "--input_path", str(bin_model_dir),
-                    ]
-                    if COLMAP_FIX_INTRINSICS:
-                        mapper_cmd += [
-                            "--Mapper.ba_refine_focal_length", "0",
-                            "--Mapper.ba_refine_extra_params", "0",
-                        ]
-                    subprocess.run(mapper_cmd, check=True, capture_output=True, timeout=1200)
-            else:
-                # ── No known poses — full mapper from scratch ──
-                logger.info("COLMAP: Mapper from scratch (no known poses)...")
-                subprocess.run([
-                    colmap_path, "mapper",
-                    "--database_path", str(colmap_db),
-                    "--image_path", str(colmap_images_dir),
-                    "--output_path", str(colmap_sparse),
-                ], check=True, capture_output=True, timeout=1200)
+                        "--Mapper.ba_use_gpu", "1"
+                    ], check=True, capture_output=True, timeout=1200)
+                except subprocess.CalledProcessError as e:
+                    stderr_text = e.stderr.decode('utf-8', errors='replace') if e.stderr else ''
+                    stdout_text = e.stdout.decode('utf-8', errors='replace') if e.stdout else ''
+                    logger.error(f"Mapper crashed!\nExit Code: {e.returncode}\nSTDERR: {stderr_text}\nSTDOUT: {stdout_text[-1000:]}")
+                    raise e
             # ── Export sparse reconstruction to PLY ──
             try:
                 ply_path = colmap_workspace / "model.ply"
@@ -205,6 +277,7 @@ class ReconstructionPipeline:
 
             # ── Dense reconstruction: undistort → patch_match → fusion ──
             try:
+                if self.progress_cb: self.progress_cb(45, "COLMAP: Undistorting Images")
                 # Find the sparse model directory (mapper uses 0/, triangulator uses sparse/)
                 sparse_model_dir = colmap_sparse / "0"
                 if not sparse_model_dir.exists():
@@ -220,6 +293,7 @@ class ReconstructionPipeline:
                     "--output_type", "COLMAP",
                 ], check=True, capture_output=True, timeout=300)
 
+                if self.progress_cb: self.progress_cb(50, "COLMAP: Dense Depth Estimation")
                 # Step B: Stereo matching (depth estimation per image pair)
                 logger.info("COLMAP: Patch match stereo (dense depth estimation)...")
                 patch_cmd = [
@@ -227,11 +301,12 @@ class ReconstructionPipeline:
                     "--workspace_path", str(colmap_dense),
                     "--workspace_format", "COLMAP",
                     "--PatchMatchStereo.geom_consistency", "true",
-                    "--PatchMatchStereo.max_image_size", "1280",
+                    "--PatchMatchStereo.max_image_size", patch_match_max_size,
                 ]
                 # Try GPU first, fall back to CPU-compatible settings
                 subprocess.run(patch_cmd, check=True, capture_output=True, timeout=1800)
 
+                if self.progress_cb: self.progress_cb(55, "COLMAP: Stereo Fusion")
                 # Step C: Stereo fusion (merge depth maps into dense point cloud)
                 dense_ply_path = colmap_dense / "fused.ply"
                 logger.info("COLMAP: Stereo fusion (merging depth maps)...")
@@ -305,6 +380,7 @@ class ReconstructionPipeline:
         if len(depth_files) == 0:
             logger.info("No depth maps available. Checking for COLMAP reconstruction.")
             
+            if self.progress_cb: self.progress_cb(65, "Processing Dense Output")
             # Check dense PLY first (much better quality)
             dense_ply = self.colmap_dir / "workspace" / "dense" / "fused.ply"
             colmap_ply = self.colmap_dir / "workspace" / "model.ply"
@@ -322,6 +398,7 @@ class ReconstructionPipeline:
                     pcd = o3d.io.read_point_cloud(str(ply_to_use))
                     logger.info(f"Loaded point cloud: {len(pcd.points)} points")
                     
+                    if self.progress_cb: self.progress_cb(70, "Refining Point Cloud")
                     # COLMAP sometimes exports pitch-black colors
                     if pcd.has_colors():
                         if np.mean(np.asarray(pcd.colors)) < 0.01:
@@ -338,6 +415,7 @@ class ReconstructionPipeline:
                     # Try Poisson surface reconstruction if we have enough points
                     if len(pcd.points) > 5000:
                         try:
+                            if self.progress_cb: self.progress_cb(75, "Poisson Surface Reconstruction")
                             logger.info("Attempting Poisson surface reconstruction...")
                             # Estimate normals
                             pcd.estimate_normals(
@@ -382,6 +460,7 @@ class ReconstructionPipeline:
         )
 
         # TSDF Volume
+        if self.progress_cb: self.progress_cb(65, "TSDF Fusion")
         logger.info("Starting TSDF fusion...")
         volume = o3d.pipelines.integration.ScalableTSDFVolume(
             voxel_length=TSDF_VOXEL_LENGTH,
@@ -390,7 +469,12 @@ class ReconstructionPipeline:
         )
 
         integrated_count = 0
-        for frame in frames:
+        total_frames = len(frames)
+        for i, frame in enumerate(frames):
+            if self.progress_cb and i % 10 == 0: 
+                prog = 65 + int(10 * (i / total_frames))
+                self.progress_cb(prog, f"TSDF Fusion ({i}/{total_frames})")
+
             depth_file = frame.get("depth")
             if depth_file is None:
                 continue
@@ -455,11 +539,13 @@ class ReconstructionPipeline:
         logger.info(f"TSDF fusion complete: {integrated_count} frames integrated")
 
         # Extract mesh
+        if self.progress_cb: self.progress_cb(75, "Extracting TSDF Mesh")
         mesh = volume.extract_triangle_mesh()
         mesh.compute_vertex_normals()
 
         # Simplify if too many faces
         if len(mesh.triangles) > TARGET_FACE_COUNT:
+            if self.progress_cb: self.progress_cb(78, "Simplifying Mesh")
             logger.info(
                 f"Simplifying mesh: {len(mesh.triangles)} → {TARGET_FACE_COUNT} faces"
             )
@@ -469,51 +555,10 @@ class ReconstructionPipeline:
         return mesh
 
     def _reconstruct_from_images_only(self, frames: list, intrinsics_data: dict):
-        """Create a point cloud from image poses (no depth maps)."""
-        try:
-            import open3d as o3d
-        except ImportError:
-            return None
-
-        # Create sparse point cloud from camera positions
-        points = []
-        colors = []
-
-        for frame in frames:
-            pose = frame.get("pose")
-            if pose is None:
-                continue
-            pos = pose["position"]
-            points.append([pos["x"], pos["y"], pos["z"]])
-            colors.append([0.3, 0.8, 0.3])  # green
-
-        if len(points) < 4:
-            return None
-
-        # Create point cloud
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(np.array(points))
-        pcd.colors = o3d.utility.Vector3dVector(np.array(colors))
-
-        # Try Poisson reconstruction from the camera trajectory
-        # This produces a basic mesh following the scan path
-        logger.info(f"Created sparse point cloud with {len(points)} points")
-
-        # Save point cloud as PLY
-        ply_path = self.output_dir / f"{self.session_id}_pointcloud.ply"
-        o3d.io.write_point_cloud(str(ply_path), pcd)
-
-        # Ensure it also gets copied to EXPORTS so the user can see it in the viewer
-        from config import EXPORTS_DIR
-        export_dir = EXPORTS_DIR / self.session_id
-        export_dir.mkdir(parents=True, exist_ok=True)
-        export_ply_path = export_dir / f"{self.session_id}_trajectory.ply"
-        import shutil
-        shutil.copy2(str(ply_path), str(export_ply_path))
-
-        # We return None for mesh, but run_full_pipeline will fail if mesh is None and colmap failed.
-        # We need a way to tell the pipeline we exported SOMETHING.
-        return pcd  # Return the pointcloud itself as a fallback!
+        """Fallback when no depth maps and no COLMAP models are found.
+        We no longer generate trajectory maps as they confuse the user."""
+        logger.warning("No valid depth or COLMAP models found. Returning None.")
+        return None
 
     def _pose_to_extrinsic(self, pose: dict) -> np.ndarray:
         """
@@ -602,6 +647,7 @@ class ReconstructionPipeline:
 
         # Export OBJ
         try:
+            if self.progress_cb: self.progress_cb(82, "Exporting OBJ")
             obj_path = export_dir / f"{self.session_id}.obj"
             tri_mesh.export(str(obj_path), file_type="obj")
             exports.append({
@@ -617,6 +663,7 @@ class ReconstructionPipeline:
 
         # Export STL
         try:
+            if self.progress_cb: self.progress_cb(85, "Exporting STL")
             stl_path = export_dir / f"{self.session_id}.stl"
             tri_mesh.export(str(stl_path), file_type="stl")
             exports.append({
@@ -632,6 +679,7 @@ class ReconstructionPipeline:
 
         # Export GLB
         try:
+            if self.progress_cb: self.progress_cb(90, "Exporting GLB")
             glb_path = export_dir / f"{self.session_id}.glb"
             tri_mesh.export(str(glb_path), file_type="glb")
             exports.append({
@@ -647,6 +695,7 @@ class ReconstructionPipeline:
 
         # Export PLY
         try:
+            if self.progress_cb: self.progress_cb(95, "Exporting PLY")
             ply_path = export_dir / f"{self.session_id}.ply"
             o3d.io.write_triangle_mesh(str(ply_path), mesh)
             exports.append({
@@ -662,9 +711,14 @@ class ReconstructionPipeline:
 
         return exports
 
-    def run_colmap_pipeline(self, export: bool = True) -> dict:
+    def run_colmap_pipeline(self, export: bool = True, quality: str = "medium", progress_cb=None) -> dict:
         """Run only COLMAP pipeline."""
+        self.quality = quality
+        self.progress_cb = progress_cb
+        
+        if self.progress_cb: self.progress_cb(5, "Starting COLMAP Pipeline")
         success = self._run_colmap()
+        if self.progress_cb: self.progress_cb(100 if success else 0, "Completed" if success else "Failed")
         return {
             "session_id": self.session_id,
             "status": "completed" if success else "failed",
@@ -676,7 +730,7 @@ class SimpleReconstruction:
     """Simplified reconstruction using only depth maps (no COLMAP)."""
 
     @staticmethod
-    def reconstruct_from_depth_maps(session_dir: Path, session_id: str) -> dict:
+    def reconstruct_from_depth_maps(session_dir: Path, session_id: str, custom_output_dir: Path = None, progress_cb=None) -> dict:
         """Quick TSDF reconstruction from depth maps only."""
-        pipeline = ReconstructionPipeline(session_dir, session_id)
-        return pipeline.run_full_pipeline(use_colmap=False)
+        pipeline = ReconstructionPipeline(session_dir, session_id, custom_output_dir)
+        return pipeline.run_full_pipeline(use_colmap=False, progress_cb=progress_cb)

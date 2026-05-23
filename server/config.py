@@ -46,7 +46,7 @@ MIN_FRAMES_FOR_RECONSTRUCTION = 20
 MAX_FRAMES_FOR_RECONSTRUCTION = 500
 
 # COLMAP parameters
-COLMAP_BINARY = r"C:\Users\enesb\Desktop\proje\emirhan\colmap-x64-windows-cuda\COLMAP.bat"
+COLMAP_BINARY = str(BASE_DIR / "colmap_bin" / "COLMAP.bat")
 COLMAP_CAMERA_MODEL = "PINHOLE"
 COLMAP_MATCHER = "sequential"
 COLMAP_MAX_IMAGE_SIZE = 1280

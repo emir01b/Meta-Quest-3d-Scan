@@ -3,7 +3,7 @@
  * Visible laser pointer from right controller for interacting with World Space UI.
  * Uses Physics.Raycast + manual button click invocation — no OVR UI dependencies.
  * Shows laser only when UI panel is visible.
- * Opens Meta Quest System Keyboard Overlay for InputField interaction.
+ * Opens the in-app address keypad for IP and port fields.
  */
 
 using UnityEngine;
@@ -35,10 +35,6 @@ namespace MetaScan
         private InputField hoveredInputField;
         private Image hoveredImage;
         private Color originalButtonColor;
-
-        // System keyboard state
-        private TouchScreenKeyboard activeKeyboard;
-        private InputField activeKeyboardField;
 
         private void Start()
         {
@@ -82,9 +78,6 @@ namespace MetaScan
 
         private void Update()
         {
-            // Always sync system keyboard text back to the InputField
-            SyncKeyboardText();
-
             // Only show laser when UI panel is visible
             bool panelVisible = handUIManager != null
                 && handUIManager.UICanvas != null
@@ -146,34 +139,6 @@ namespace MetaScan
                 hitDot.SetActive(false);
                 UpdateHover(null, null);
                 ResetLaserColor();
-            }
-        }
-
-        // =========================================================
-        // System Keyboard Sync (runs every frame in Update)
-        // =========================================================
-
-        private void SyncKeyboardText()
-        {
-            if (activeKeyboard == null || activeKeyboardField == null) return;
-
-            // Her karede anlık harf harf eşitleme yap
-            activeKeyboardField.text = activeKeyboard.text;
-
-            if (activeKeyboard.status == TouchScreenKeyboard.Status.Done)
-            {
-                activeKeyboardField.text = activeKeyboard.text;
-                activeKeyboardField.DeactivateInputField();
-                Debug.Log("[MetaScan-Pointer] Keyboard done. Text: " + activeKeyboard.text);
-                activeKeyboard = null;
-                activeKeyboardField = null;
-            }
-            else if (activeKeyboard.status == TouchScreenKeyboard.Status.Canceled ||
-                     activeKeyboard.status == TouchScreenKeyboard.Status.LostFocus)
-            {
-                activeKeyboardField.DeactivateInputField();
-                activeKeyboard = null;
-                activeKeyboardField = null;
             }
         }
 
@@ -297,23 +262,8 @@ namespace MetaScan
                 }
                 else if (field != null)
                 {
-                    // Open Meta Quest System Keyboard Overlay
-                    // Requires OVRManager.requiresSystemKeyboard = true (set in MRSetup.cs)
-                    // and "oculus.software.overlay_keyboard" in AndroidManifest.xml
-                    string currentText = field.text ?? "";
-
-                    activeKeyboard = TouchScreenKeyboard.Open(
-                        currentText,
-                        TouchScreenKeyboardType.Default,
-                        false,  // autocorrection
-                        false,  // multiline
-                        false,  // secure
-                        false,  // alert
-                        ""      // placeholder
-                    );
-                    activeKeyboardField = field;
-
-                    Debug.Log("[MetaScan-Pointer] System keyboard opened for: " + field.gameObject.name);
+                    handUIManager.OpenKeypad(field);
+                    Debug.Log("[MetaScan-Pointer] Address keypad opened for: " + field.gameObject.name);
 
                     if (hoveredImage != null)
                     {

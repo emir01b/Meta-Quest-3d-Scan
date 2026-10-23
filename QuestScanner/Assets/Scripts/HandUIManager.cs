@@ -1,7 +1,7 @@
 /*
  * MetaScan — Hand UI Manager
  * Creates a World Space Canvas attached to the left controller.
- * Panel is visible while left grip is held down.
+ * Left grip toggles the panel so text entry remains usable with both hands.
  * Uses only built-in Unity UI (no TMPro dependency).
  */
 
@@ -41,6 +41,12 @@ namespace MetaScan
 
         private InputField ipInputField;
         private InputField portInputField;
+        private GameObject keypadPanel;
+        private InputField keypadTarget;
+        private Text keypadTitleText;
+        private Text keypadValueText;
+        private Text keypadMessageText;
+        private string keypadValue;
         private Button connectButton;
         private Text connectButtonText;
         private Image connectionIndicator;
@@ -61,7 +67,7 @@ namespace MetaScan
         public event Action OnScanRequested;
         public event Action OnStopRequested;
 
-        private bool isUIVisible = false; // Starts hidden
+        private bool isUIVisible = true;
 
         // Public accessors
         public Canvas UICanvas => uiCanvas;
@@ -76,15 +82,13 @@ namespace MetaScan
             // Delay event system setup by one frame so OVRCameraRig anchors are ready
             StartCoroutine(DelayedSetup());
 
-            // Subscribe to grip events for hold-to-show
+            // Toggle the panel on grip press; releasing the grip keeps the keypad visible.
             if (controllerManager != null)
             {
                 controllerManager.OnLeftGripDown += OnLeftGripDown;
-                controllerManager.OnLeftGripUp += OnLeftGripUp;
             }
 
-            // Start hidden
-            SetVisible(false);
+            SetVisible(true);
         }
 
         private System.Collections.IEnumerator DelayedSetup()
@@ -95,12 +99,7 @@ namespace MetaScan
 
         private void OnLeftGripDown()
         {
-            SetVisible(true);
-        }
-
-        private void OnLeftGripUp()
-        {
-            SetVisible(false);
+            ToggleVisible();
         }
 
         // =========================================================
@@ -172,6 +171,7 @@ namespace MetaScan
             CreateConnectionSection(canvasRect);
             CreateActionSection(canvasRect);
             CreateStatusSection(canvasRect);
+            CreateKeypad(canvasRect);
 
             Debug.Log("[MetaScan-UI] Hand UI created and attached to left controller");
         }
@@ -298,11 +298,115 @@ namespace MetaScan
             qualityText = CreateLabel(parent, "Kalite: --", 10, Color.gray,
                 new Vector2(w / 2f, y + 18f), new Vector2(w / 2f - pad, 14f), TextAnchor.MiddleRight);
 
-            instructionText = CreateLabel(parent, "Sol gribi basili tut = panel", 9, warningColor,
+            instructionText = CreateLabel(parent, "IP icin sag tetik; sol grip paneli acar/kapatir", 9, warningColor,
                 new Vector2(pad, y + 36f), new Vector2(w - pad * 2, 24f), TextAnchor.MiddleCenter);
 
             progressBar = CreateProgressSlider(parent,
                 new Vector2(pad, y + 64f), new Vector2(w - pad * 2, 8f));
+        }
+
+        private void CreateKeypad(RectTransform parent)
+        {
+            keypadPanel = CreateUIObj("AddressKeypad", parent);
+            keypadPanel.AddComponent<Image>().color = panelColor;
+            StretchFill(keypadPanel);
+            RectTransform keypadRect = keypadPanel.GetComponent<RectTransform>();
+
+            keypadTitleText = CreateLabel(keypadRect, "IP adresi", 15, accentColor,
+                new Vector2(8f, 7f), new Vector2(304f, 22f), TextAnchor.MiddleCenter);
+            GameObject display = CreateUIObj("KeypadValue", keypadPanel.transform);
+            display.AddComponent<Image>().color = new Color(0.15f, 0.15f, 0.2f, 1f);
+            SetRect(display, new Vector2(8f, 32f), new Vector2(304f, 30f));
+            keypadValueText = CreateLabel(display.GetComponent<RectTransform>(), "", 15, Color.white,
+                new Vector2(5f, 3f), new Vector2(294f, 24f), TextAnchor.MiddleLeft);
+
+            string[] keys = {
+                "1", "2", "3", "Sil",
+                "4", "5", "6", "Temizle",
+                "7", "8", "9", ".",
+                "Iptal", "0", "", "Tamam"
+            };
+            for (int i = 0; i < keys.Length; i++)
+            {
+                string key = keys[i];
+                if (key.Length == 0) continue;
+                int row = i / 4;
+                int column = i % 4;
+                Button button = CreateBtn(keypadRect, key, accentColor,
+                    new Vector2(8f + column * 76f, 69f + row * 42f), new Vector2(68f, 35f));
+                button.GetComponentInChildren<Text>().fontSize = key.Length > 3 ? 10 : 16;
+                button.onClick.AddListener(() => PressKeypadKey(key));
+            }
+            keypadMessageText = CreateLabel(keypadRect, "", 9, warningColor,
+                new Vector2(8f, 235f), new Vector2(304f, 18f), TextAnchor.MiddleCenter);
+            keypadPanel.SetActive(false);
+        }
+
+        public void OpenKeypad(InputField field)
+        {
+            if (keypadPanel == null || (field != ipInputField && field != portInputField)) return;
+            keypadTarget = field;
+            keypadValue = field.text ?? "";
+            keypadTitleText.text = field == ipInputField ? "IP adresi" : "Port";
+            keypadMessageText.text = "";
+            keypadValueText.text = keypadValue;
+            foreach (Transform child in canvasObject.transform)
+                if (child.gameObject != keypadPanel) child.gameObject.SetActive(false);
+            keypadPanel.SetActive(true);
+        }
+
+        private void PressKeypadKey(string key)
+        {
+            if (keypadTarget == null) return;
+            if (key == "Iptal") { CloseKeypad(); return; }
+            if (key == "Tamam")
+            {
+                if (keypadTarget == ipInputField && !IsValidIpv4(keypadValue))
+                {
+                    keypadMessageText.text = "Dort bolumlu gecerli IP girin";
+                    return;
+                }
+                if (keypadTarget == portInputField &&
+                    (!int.TryParse(keypadValue, out int port) || port < 1 || port > 65535))
+                {
+                    keypadMessageText.text = "Port 1-65535 olmali";
+                    return;
+                }
+                keypadTarget.text = keypadValue;
+                CloseKeypad();
+                return;
+            }
+            if (key == "Temizle") keypadValue = "";
+            else if (key == "Sil") keypadValue = keypadValue.Length > 0
+                ? keypadValue.Substring(0, keypadValue.Length - 1) : "";
+            else if (key == ".")
+            {
+                if (keypadTarget == ipInputField && keypadValue.Length > 0 &&
+                    !keypadValue.EndsWith(".") && keypadValue.Split('.').Length < 4)
+                    keypadValue += ".";
+            }
+            else if (keypadValue.Length < (keypadTarget == ipInputField ? 15 : 5))
+                keypadValue += key;
+            keypadValueText.text = keypadValue;
+            keypadMessageText.text = "";
+        }
+
+        private void CloseKeypad()
+        {
+            keypadPanel.SetActive(false);
+            foreach (Transform child in canvasObject.transform)
+                if (child.gameObject != keypadPanel) child.gameObject.SetActive(true);
+            keypadTarget = null;
+        }
+
+        private static bool IsValidIpv4(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value)) return false;
+            string[] parts = value.Split('.');
+            if (parts.Length != 4) return false;
+            foreach (string part in parts)
+                if (part.Length == 0 || !byte.TryParse(part, out _)) return false;
+            return true;
         }
 
         // =========================================================
@@ -482,8 +586,14 @@ namespace MetaScan
             {
                 GameObject esObj = new GameObject("EventSystem");
                 es = esObj.AddComponent<EventSystem>();
-                esObj.AddComponent<StandaloneInputModule>();
             }
+
+            // VRUIPointer dispatches UI clicks from OVRInput itself. The legacy
+            // StandaloneInputModule polls UnityEngine.Input every frame and
+            // throws when this project uses only the new Input System.
+            StandaloneInputModule legacyModule = es.GetComponent<StandaloneInputModule>();
+            if (legacyModule != null)
+                Destroy(legacyModule);
         }
 
         // =========================================================
@@ -492,12 +602,18 @@ namespace MetaScan
 
         private void OnConnectClicked()
         {
-            string ip = ipInputField != null ? ipInputField.text : "192.168.1.100";
-            int port = 8765;
-            if (portInputField != null)
+            string ip = ipInputField != null ? ipInputField.text.Trim() : defaultIP;
+            if (!IsValidIpv4(ip))
             {
-                int.TryParse(portInputField.text, out port);
-                if (port <= 0 || port > 65535) port = 8765;
+                SetInstruction("Gecerli bir IPv4 adresi girin");
+                return;
+            }
+            int port = defaultPort;
+            if (portInputField != null &&
+                (!int.TryParse(portInputField.text, out port) || port < 1 || port > 65535))
+            {
+                SetInstruction("Port 1-65535 olmali");
+                return;
             }
 
             // Save to PlayerPrefs so it is remembered on next launch
@@ -593,7 +709,6 @@ namespace MetaScan
             if (controllerManager != null)
             {
                 controllerManager.OnLeftGripDown -= OnLeftGripDown;
-                controllerManager.OnLeftGripUp -= OnLeftGripUp;
             }
         }
     }

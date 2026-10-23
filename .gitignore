@@ -12,6 +12,8 @@ QuestScanner/.utmp/
 QuestScanner/MemoryCaptures/
 QuestScanner/[Bb]urst*/
 QuestScanner**/Recordings/
+QuestScanner/Assets/Resources/DevAgentSettings.asset
+QuestScanner/Assets/Resources/DevAgentSettings.asset.meta
 
 # Unity/OS
 *.apk

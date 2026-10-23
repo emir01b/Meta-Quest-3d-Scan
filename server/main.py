@@ -6,6 +6,8 @@ and orchestrates 3D reconstruction.
 import asyncio
 import json
 import logging
+import math
+import re
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -13,15 +15,15 @@ from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from config import (
     SERVER_HOST, SERVER_PORT, SESSIONS_DIR, EXPORTS_DIR,
     MIN_FRAMES_FOR_RECONSTRUCTION
 )
-from frame_handler import FrameHandler
-from reconstruction import ReconstructionPipeline, SimpleReconstruction
+from frame_handler import FrameHandler, atomic_write
+from reconstruction import ReconstructionPipeline
 
 # Configure logging
 logging.basicConfig(
@@ -31,10 +33,96 @@ logging.basicConfig(
 )
 logger = logging.getLogger("metascan.server")
 
-# Active sessions
-active_sessions: dict[str, dict] = {}
 reconstruction_tasks: dict[str, asyncio.Task] = {}
 reconstruction_progress: dict[str, dict] = {}
+
+
+def _session_dir(session_id: str) -> Path:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,96}", session_id):
+        raise HTTPException(status_code=400, detail="Invalid session id")
+    return SESSIONS_DIR / session_id
+
+
+def _validate_roi(roi):
+    if roi is None or roi == {}:
+        return None
+    try:
+        center = roi["center"]
+        numbers = [float(center[k]) for k in ("x", "y", "z")]
+        radius = float(roi["radius"])
+        if not all(math.isfinite(v) for v in numbers + [radius]) or not 0.01 <= radius <= 5:
+            raise ValueError("invalid ROI")
+        return {"center": dict(zip(("x", "y", "z"), numbers)), "radius": radius}
+    except (TypeError, KeyError, ValueError) as exc:
+        raise ValueError("Invalid object selection volume") from exc
+
+
+def _job_status(session_id: str) -> dict:
+    task = reconstruction_tasks.get(session_id)
+    if task is None:
+        if session_id is None:
+            return {"status": "not_started"}
+        state_file = _session_dir(session_id) / "reconstruction_job.json"
+        if state_file.exists():
+            state = json.loads(state_file.read_text(encoding="utf-8"))
+            if state.get("status") == "running":
+                return {"status": "interrupted", "step": "Server stopped during reconstruction"}
+            return state
+        return {"status": "not_started"}
+    progress = reconstruction_progress.get(session_id, {"progress": 0, "step": ""})
+    if not task.done():
+        return {"status": "running", **progress}
+    try:
+        result = task.result()
+    except Exception as exc:
+        return {"status": "failed", "error": str(exc), **progress}
+    return {"status": result.get("status", "failed"), "result": result,
+            "progress": 100 if result.get("status") == "completed" else progress["progress"],
+            "step": "Done" if result.get("status") == "completed" else result.get("error", "Failed")}
+
+
+def _start_job(session_id: str, method: str, quality: str, output_dir: str = None) -> dict:
+    session_dir = _session_dir(session_id)
+    meta_path = session_dir / "session_metadata.json"
+    if not meta_path.exists():
+        raise HTTPException(status_code=404, detail="Finalized session not found")
+    metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+    if metadata.get("status") != "captured" or metadata.get("protocol_version") != 2:
+        raise HTTPException(status_code=409, detail="Session is not a finalized physical-camera capture")
+    if metadata.get("total_frames", 0) < MIN_FRAMES_FOR_RECONSTRUCTION:
+        raise HTTPException(status_code=409, detail="Not enough captured frames")
+    if method not in ("colmap", "tsdf") or quality not in ("low", "medium", "high"):
+        raise HTTPException(status_code=400, detail="Invalid reconstruction method or quality")
+    if method == "tsdf":
+        raise HTTPException(status_code=400, detail="Registered metric depth is not available")
+    if output_dir is not None and not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", output_dir):
+        raise HTTPException(status_code=400, detail="Output subfolder must be a simple name")
+    existing = reconstruction_tasks.get(session_id)
+    if existing is not None and not existing.done():
+        return {"status": "already_running", "session_id": session_id}
+    reconstruction_progress[session_id] = {"progress": 0, "step": "Starting"}
+    state_file = session_dir / "reconstruction_job.json"
+    atomic_write(state_file, json.dumps({"status": "running", "method": method,
+                                         "quality": quality}).encode("utf-8"))
+    loop = asyncio.get_running_loop()
+
+    def progress_callback(progress: int, step: str):
+        loop.call_soon_threadsafe(reconstruction_progress.__setitem__, session_id,
+                                  {"progress": progress, "step": step})
+
+    def execute():
+        output = EXPORTS_DIR / session_id / output_dir if output_dir else None
+        pipeline = ReconstructionPipeline(session_dir, session_id, output)
+        result = pipeline.run_colmap_pipeline(quality, progress_callback)
+        atomic_write(state_file, json.dumps({
+            "status": result.get("status", "failed"),
+            "result": result, "progress": 100 if result.get("status") == "completed" else 0,
+            "step": "Done" if result.get("status") == "completed" else result.get("error", "Failed"),
+        }, default=str).encode("utf-8"))
+        return result
+
+    reconstruction_tasks[session_id] = asyncio.create_task(asyncio.to_thread(execute))
+    return {"status": "started", "session_id": session_id, "method": method, "quality": quality}
 
 
 @asynccontextmanager
@@ -72,11 +160,6 @@ app.add_middleware(
 viewer_dir = Path(__file__).parent.parent / "viewer"
 if viewer_dir.exists():
     app.mount("/viewer", StaticFiles(directory=str(viewer_dir), html=True), name="viewer")
-
-# Serve exported models
-if EXPORTS_DIR.exists():
-    app.mount("/exports", StaticFiles(directory=str(EXPORTS_DIR)), name="exports")
-
 
 # =============================================================================
 # REST API Endpoints
@@ -121,7 +204,7 @@ async def list_sessions():
 @app.get("/api/sessions/{session_id}")
 async def get_session(session_id: str):
     """Get session details."""
-    session_dir = SESSIONS_DIR / session_id
+    session_dir = _session_dir(session_id)
     if not session_dir.exists():
         raise HTTPException(status_code=404, detail="Session not found")
 
@@ -138,96 +221,46 @@ async def get_session(session_id: str):
 
 
 @app.post("/api/sessions/{session_id}/reconstruct")
-async def start_reconstruction(session_id: str, method: str = "full", quality: str = "medium", output_dir: str = None):
+async def start_reconstruction(session_id: str, method: str = "colmap", quality: str = "medium", output_dir: str = None):
     """
     Start 3D reconstruction for a session.
-    method: 'colmap', 'full' (both), or 'tsdf' (depth-only fallback)
+    method: 'colmap'; 'tsdf' is rejected until calibrated metric depth exists
     quality: 'low', 'medium', 'high'
-    output_dir: Custom output directory path (optional)
+    output_dir: Optional simple subfolder under the session's export directory
     """
-    session_dir = SESSIONS_DIR / session_id
-    if not session_dir.exists():
-        raise HTTPException(status_code=404, detail="Session not found")
-
-    if session_id in reconstruction_tasks:
-        task = reconstruction_tasks[session_id]
-        if not task.done():
-            return {"status": "already_running", "session_id": session_id}
-
-    reconstruction_progress[session_id] = {"progress": 0, "step": "Starting"}
-
-    def progress_callback(progress: int, step: str):
-        reconstruction_progress[session_id] = {"progress": progress, "step": step}
-
-    async def run_reconstruction():
-        loop = asyncio.get_event_loop()
-        
-        custom_out_path = Path(output_dir) if output_dir else None
-        pipeline = ReconstructionPipeline(session_dir, session_id, custom_out_path)
-
-        if method == "tsdf":
-            result = await loop.run_in_executor(
-                None, SimpleReconstruction.reconstruct_from_depth_maps,
-                session_dir, session_id, custom_out_path, progress_callback
-            )
-        elif method == "colmap":
-            result = await loop.run_in_executor(
-                None, pipeline.run_colmap_pipeline, True, quality, progress_callback
-            )
-        else:  # full
-            result = await loop.run_in_executor(
-                None, pipeline.run_full_pipeline, True, quality, progress_callback
-            )
-
-        logger.info(
-            f"Reconstruction complete for {session_id}: "
-            f"{result.get('status', 'unknown')}"
-        )
-        return result
-
-    task = asyncio.create_task(run_reconstruction())
-    reconstruction_tasks[session_id] = task
-
-    return {"status": "started", "session_id": session_id, "method": method, "quality": quality}
+    return _start_job(session_id, method, quality, output_dir)
 
 
 @app.get("/api/sessions/{session_id}/reconstruction/status")
 async def reconstruction_status(session_id: str):
     """Check reconstruction status."""
-    if session_id not in reconstruction_tasks:
-        return {"status": "not_started"}
-
-    progress_info = reconstruction_progress.get(session_id, {"progress": 0, "step": ""})
-    task = reconstruction_tasks[session_id]
-    
-    if task.done():
-        try:
-            result = task.result()
-            status = result.get("status", "completed")
-            return {"status": status, "result": result, "progress": 100, "step": "Done"}
-        except Exception as e:
-            return {"status": "failed", "error": str(e), "progress": progress_info["progress"], "step": "Failed"}
-    else:
-        return {"status": "running", "progress": progress_info["progress"], "step": progress_info["step"]}
+    _session_dir(session_id)
+    return _job_status(session_id)
 
 
 @app.get("/api/sessions/{session_id}/exports")
 async def list_exports(session_id: str):
     """List exported files for a session."""
-    export_dir = EXPORTS_DIR / session_id
-    if not export_dir.exists():
-        return {"exports": []}
+    _session_dir(session_id)
+    state = _job_status(session_id)
+    result = state.get("result", {})
+    return {"exports": result.get("exports", []) if state.get("status") == "completed" else [],
+            "status": state.get("status", "not_started")}
 
-    exports = []
-    for f in export_dir.iterdir():
-        if f.is_file():
-            exports.append({
-                "filename": f.name,
-                "format": f.suffix.lstrip(".").upper(),
-                "size_mb": round(f.stat().st_size / (1024 * 1024), 2),
-                "url": f"/exports/{session_id}/{f.name}",
-            })
-    return {"exports": exports}
+
+@app.get("/api/sessions/{session_id}/exports/{filename}")
+async def download_export(session_id: str, filename: str):
+    _session_dir(session_id)
+    state = _job_status(session_id)
+    if state.get("status") != "completed":
+        raise HTTPException(status_code=404, detail="No completed export")
+    for item in state.get("result", {}).get("exports", []):
+        if item.get("filename") == filename:
+            path = Path(item["path"])
+            if path.name != filename or not path.is_file():
+                break
+            return FileResponse(path, filename=filename)
+    raise HTTPException(status_code=404, detail="Export not found")
 
 
 # =============================================================================
@@ -236,113 +269,95 @@ async def list_exports(session_id: str):
 
 @app.websocket("/ws/scan")
 async def websocket_scan(websocket: WebSocket):
-    """
-    WebSocket endpoint for real-time frame streaming from Quest 3S.
-
-    Protocol:
-    1. Client sends JSON: {"action": "start_session", "name": "my_scan"}
-    2. Server responds: {"action": "session_started", "session_id": "..."}
-    3. Client sends binary frames (see FrameHandler for format)
-    4. Server responds with quality feedback per frame
-    5. Client sends JSON: {"action": "stop_session"}
-    6. Server finalizes and optionally starts reconstruction
-    """
+    """Ordered MSF2 ingest. Stop ACK follows durable frame and metadata writes."""
     await websocket.accept()
     logger.info("Quest client connected")
-
     session_id = None
     handler = None
-
     try:
         while True:
             data = await websocket.receive()
-
             if data.get("type") == "websocket.disconnect":
-                logger.info(f"Quest client disconnected (session: {session_id})")
                 break
-
-            if "text" in data:
-                msg = json.loads(data["text"])
+            if data.get("text") is not None:
+                try:
+                    msg = json.loads(data["text"])
+                except ValueError:
+                    await websocket.send_json({"action": "error", "message": "Invalid JSON command"})
+                    continue
+                if not isinstance(msg, dict):
+                    await websocket.send_json({"action": "error", "message": "Invalid command"})
+                    continue
                 action = msg.get("action")
-
                 if action == "start_session":
-                    session_name = msg.get("name", "scan")
+                    if handler is not None:
+                        await websocket.send_json({"action": "error", "message": "Session already started"})
+                        continue
+                    try:
+                        roi = _validate_roi(msg.get("roi"))
+                    except ValueError as exc:
+                        await websocket.send_json({"action": "error", "message": str(exc)})
+                        continue
+                    raw_name = str(msg.get("name", "scan"))[:32]
+                    session_name = re.sub(r"[^A-Za-z0-9_-]", "_", raw_name) or "scan"
                     session_id = (
                         f"{session_name}_"
                         f"{time.strftime('%Y%m%d_%H%M%S')}_"
                         f"{uuid.uuid4().hex[:6]}"
                     )
-                    handler = FrameHandler(session_id)
-                    active_sessions[session_id] = {
-                        "handler": handler,
-                        "created_at": time.time(),
-                        "status": "capturing",
-                    }
-                    await websocket.send_json({
-                        "action": "session_started",
-                        "session_id": session_id,
-                    })
-                    logger.info(f"Session started: {session_id}")
-
+                    handler = FrameHandler(session_id, roi=roi)
+                    await websocket.send_json({"action": "session_started", "session_id": session_id})
                 elif action == "stop_session":
                     if handler:
-                        handler.save_session_metadata()
-                        handler.prepare_colmap_input()
+                        if not handler.finalized:
+                            await asyncio.to_thread(handler.prepare_colmap_input)
+                            await asyncio.to_thread(handler.save_session_metadata, "captured")
                         frame_count = handler.accepted_frames
-
-                        active_sessions[session_id]["status"] = "captured"
                         await websocket.send_json({
-                            "action": "session_stopped",
-                            "session_id": session_id,
+                            "action": "session_stopped", "session_id": session_id,
                             "total_frames": frame_count,
-                            "ready_for_reconstruction": (
-                                frame_count >= MIN_FRAMES_FOR_RECONSTRUCTION
-                            ),
+                            "ready_for_reconstruction": frame_count >= MIN_FRAMES_FOR_RECONSTRUCTION,
                         })
-                        logger.info(
-                            f"Session stopped: {session_id} ({frame_count} frames)"
-                        )
+                        # Permit another scan on the same connection. Retain
+                        # session_id so reconstruction/status still address the
+                        # session just completed until the next start_session.
+                        handler = None
                     else:
-                        await websocket.send_json({
-                            "action": "error",
-                            "message": "No active session",
-                        })
-
+                        await websocket.send_json({"action": "error", "message": "No active session"})
                 elif action == "start_reconstruction":
-                    method = msg.get("method", "full")
-                    if session_id and handler:
-                        await websocket.send_json({
-                            "action": "reconstruction_started",
-                            "session_id": session_id,
-                            "method": method,
-                        })
-
+                    try:
+                        if session_id is None:
+                            raise HTTPException(status_code=409, detail="No session")
+                        outcome = _start_job(session_id, msg.get("method", "colmap"),
+                                             msg.get("quality", "medium"))
+                        await websocket.send_json({"action": "reconstruction_started", **outcome})
+                    except HTTPException as exc:
+                        await websocket.send_json({"action": "error", "message": str(exc.detail)})
+                elif action == "get_reconstruction_status":
+                    await websocket.send_json({
+                        "action": "reconstruction_status", **_job_status(session_id)
+                    })
                 elif action == "ping":
                     await websocket.send_json({"action": "pong"})
-
-            elif "bytes" in data:
-                if handler is None:
+                else:
+                    await websocket.send_json({"action": "error", "message": "Unknown action"})
+            elif data.get("bytes") is not None:
+                if handler is None or handler.finalized:
                     await websocket.send_json({
-                        "action": "error",
-                        "message": "No active session. Send start_session first.",
+                        "action": "error", "message": "No capturing session",
                     })
                     continue
-
-                result = handler.process_frame(data["bytes"])
-                await websocket.send_json({
-                    "action": "frame_result",
-                    **result,
-                })
-
+                result = await asyncio.to_thread(handler.process_frame, data["bytes"])
+                await websocket.send_json({"action": "frame_result", **result})
     except WebSocketDisconnect:
-        logger.info(f"Quest client disconnected (session: {session_id})")
-        if handler:
-            handler.save_session_metadata()
-            handler.prepare_colmap_input()
-    except Exception as e:
-        logger.error(f"WebSocket error: {e}", exc_info=True)
-        if handler:
-            handler.save_session_metadata()
+        pass
+    except Exception:
+        logger.exception("WebSocket scan failed for %s", session_id)
+    finally:
+        if handler is not None and not handler.finalized:
+            # A missing stop ACK is never represented as a complete capture.
+            handler.save_session_metadata("interrupted")
+        logger.info("Quest client disconnected (session: %s)", session_id)
 
 
 # =============================================================================
@@ -356,5 +371,6 @@ if __name__ == "__main__":
         host=SERVER_HOST,
         port=SERVER_PORT,
         reload=False,
+        ws="websockets",
         log_level="info",
     )

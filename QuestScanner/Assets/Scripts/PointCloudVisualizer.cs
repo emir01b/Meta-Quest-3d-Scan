@@ -29,10 +29,6 @@ namespace MetaScan
         [Tooltip("İki nokta arası minimum mesafe (metre) — tekrar engelleme")]
         [SerializeField] private float deduplicationDistance = 0.005f;
 
-        [Header("Fallback (depth yoksa)")]
-        [SerializeField] private int fallbackPointsPerFrame = 20;
-        [SerializeField] private float fallbackPointSpread = 0.3f;
-        [SerializeField] private float fallbackPointNoise = 0.02f;
 
         // Particle system
         private ParticleSystem _ps;
@@ -186,46 +182,6 @@ namespace MetaScan
             if (pointsAdded > 0)
             {
                 Debug.Log($"[MetaScan-PointCloud] +{pointsAdded} gerçek depth noktası (toplam: {currentPointCount})");
-            }
-        }
-
-        /// <summary>
-        /// Derinlik verisi yokken fallback: kamera yönünde tahmini noktalar saçar.
-        /// Eski davranışın korunması.
-        /// </summary>
-        public void AddFramePoints(Vector3 cameraPos, Vector3 forward,
-            Vector3 right, Vector3 up, bool qualityOk, float hitDistance)
-        {
-            if (_ps == null || currentPointCount >= maxPoints) return;
-
-            Color pointColor = qualityOk ? goodColor : poorColor;
-            float dist = hitDistance > 0.1f ? hitDistance : 1.0f;
-
-            int pointsToAdd = Mathf.Min(fallbackPointsPerFrame, maxPoints - currentPointCount);
-
-            for (int i = 0; i < pointsToAdd; i++)
-            {
-                float offsetX = Random.Range(-fallbackPointSpread, fallbackPointSpread);
-                float offsetY = Random.Range(-fallbackPointSpread, fallbackPointSpread);
-
-                Vector3 pos = cameraPos
-                    + forward * dist
-                    + right * offsetX
-                    + up * offsetY;
-
-                pos += new Vector3(
-                    Random.Range(-fallbackPointNoise, fallbackPointNoise),
-                    Random.Range(-fallbackPointNoise, fallbackPointNoise),
-                    Random.Range(-fallbackPointNoise, fallbackPointNoise)
-                );
-
-                if (objectSelector != null && objectSelector.HasSelection)
-                {
-                    if (!objectSelector.IsPointInSelection(pos))
-                        continue;
-                }
-
-                EmitPoint(pos, pointColor);
             }
         }
 

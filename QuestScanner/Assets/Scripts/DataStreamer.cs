@@ -1,54 +1,74 @@
-/*
- * MetaScan — Data Streamer
- * Streams captured frames to PC server via WebSocket.
- * Implements binary frame protocol with send queue.
- */
-
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.IO;
+using System.Net.WebSockets;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 using UnityEngine;
-using UnityEngine.Networking;
 
 namespace MetaScan
 {
     public class DataStreamer : MonoBehaviour
     {
-        [Header("Server Settings")]
         [SerializeField] private string serverIP = "192.168.1.100";
         [SerializeField] private int serverPort = 8765;
-
-        [Header("Streaming Settings")]
         [SerializeField] private int maxQueueSize = 30;
 
-        // State
         public bool IsConnected { get; private set; }
         public string SessionId { get; private set; }
         public int FramesSent { get; private set; }
-
-        // Events
+        public int FramesAccepted { get; private set; }
+        public int FramesDropped { get; private set; }
         public event Action<string> OnConnected;
         public event Action<string> OnDisconnected;
         public event Action<string> OnSessionStarted;
+        public event Action<int, bool> OnSessionStopped;
         public event Action<FrameFeedback> OnFrameFeedback;
+        public event Action<string, string> OnReconstructionStatus;
         public event Action<string> OnError;
 
-        // WebSocket
         private WebSocketClient wsClient;
-        private Queue<byte[]> sendQueue = new Queue<byte[]>();
-        private bool isSending;
-
-        // Frame protocol
-        private static readonly byte[] FRAME_MAGIC = new byte[] { 0x4D, 0x53, 0x46, 0x01 }; // "MSF\x01"
-        private const int HEADER_SIZE = 32;
-
-        // Components
         private CameraCapture cameraCapture;
-        private DepthCapture depthCapture;
+        private readonly Queue<OutgoingMessage> sendQueue = new Queue<OutgoingMessage>();
+        private bool isSending, sessionReady, stopRequested, stopQueued, stopAcknowledged, reconstructionRunning;
+        private float nextStatusPoll;
 
-        [Serializable]
-        public class FrameFeedback
+        private struct OutgoingMessage
+        {
+            public byte[] payload;
+            public WebSocketMessageType type;
+            public bool frame;
+        }
+
+        [Serializable] private class IntrinsicsData { public float fx, fy, cx, cy; }
+        [Serializable] private class PoseData { public Vector3 position; public Quaternion rotation; }
+        [Serializable] private class FrameMetadata
+        {
+            public int protocol_version = 2;
+            public int frame_index;
+            public string camera_timestamp, camera_id;
+            public string image_orientation = "top_left";
+            public string pose_space = "unity_world_camera_to_world";
+            public int image_width, image_height;
+            public IntrinsicsData intrinsics;
+            public PoseData pose;
+        }
+        [Serializable] private class SelectionData { public Vector3 center; public float radius; }
+        [Serializable] private class ClientCommand
+        {
+            public string action, name, method;
+            public SelectionData roi;
+        }
+        [Serializable] private class ServerMessage
+        {
+            public string action, session_id, status, message, step, error;
+            public int total_frames, progress;
+            public bool ready_for_reconstruction, quality_ok;
+            public string[] quality_issues;
+        }
+        [Serializable] public class FrameFeedback
         {
             public string status;
             public int total_frames;
@@ -59,430 +79,309 @@ namespace MetaScan
         private void Start()
         {
             cameraCapture = FindFirstObjectByType<CameraCapture>();
-            depthCapture = FindFirstObjectByType<DepthCapture>();
-
             if (cameraCapture != null)
+            {
                 cameraCapture.OnFrameCaptured += OnFrameCaptured;
+                cameraCapture.OnCaptureError += ReportError;
+            }
         }
 
-        // =========================================================
-        // Connection
-        // =========================================================
-
-        public string ServerIP
-        {
-            get => serverIP;
-            set => serverIP = value;
-        }
-
-        public int ServerPort
-        {
-            get => serverPort;
-            set => serverPort = value;
-        }
-
-        public void SetServerInfo(string ip, int port)
-        {
-            serverIP = ip;
-            serverPort = port;
-        }
+        public string ServerIP { get => serverIP; set => serverIP = value; }
+        public int ServerPort { get => serverPort; set => serverPort = value; }
+        public void SetServerInfo(string ip, int port) { serverIP = ip; serverPort = port; }
 
         public void Connect()
         {
+            if (wsClient != null) Disconnect();
             string url = $"ws://{serverIP}:{serverPort}/ws/scan";
-            Debug.Log($"[MetaScan-Stream] Connecting to {url}...");
-
-            wsClient = new WebSocketClient();
-            StartCoroutine(wsClient.Connect(url,
-                onOpen: () =>
+            Debug.Log("[MetaScan-Stream] Connecting to " + url);
+            var client = new WebSocketClient();
+            wsClient = client;
+            StartCoroutine(client.Connect(url,
+                () => { if (wsClient == client) { IsConnected = true; OnConnected?.Invoke(url); } },
+                message => { if (wsClient == client) HandleMessage(message); },
+                error => { if (wsClient == client) ReportError(error); },
+                reason =>
                 {
-                    IsConnected = true;
-                    OnConnected?.Invoke(url);
-                    Debug.Log("[MetaScan-Stream] Connected to server");
-                },
-                onMessage: (msg) => HandleMessage(msg),
-                onError: (err) =>
-                {
-                    OnError?.Invoke(err);
-                    Debug.LogError($"[MetaScan-Stream] Error: {err}");
-                },
-                onClose: (reason) =>
-                {
+                    if (wsClient != client) return;
                     IsConnected = false;
+                    sessionReady = false;
+                    reconstructionRunning = false;
+                    wsClient = null;
+                    cameraCapture?.StopCapturing();
                     OnDisconnected?.Invoke(reason);
-                    Debug.Log($"[MetaScan-Stream] Disconnected: {reason}");
-                }
-            ));
+                }));
         }
 
         public void Disconnect()
         {
-            if (wsClient != null)
-            {
-                wsClient.Close();
-                wsClient = null;
-            }
+            cameraCapture?.StopCapturing();
+            wsClient?.Close();
+            wsClient = null;
             IsConnected = false;
+            sessionReady = false;
+            reconstructionRunning = false;
+            stopRequested = stopQueued = stopAcknowledged = false;
+            SessionId = null;
+            sendQueue.Clear();
         }
 
-        // =========================================================
-        // Session Management
-        // =========================================================
-
-        public void StartSession(string name = "scan")
+        public void StartSession(string name = "scan", bool hasSelection = false,
+            Vector3 selectionCenter = default, float selectionRadius = 0f)
         {
-            if (!IsConnected) return;
-            FramesSent = 0;
-            sendQueue.Clear();
-
-            string msg = "{\"action\":\"start_session\",\"name\":\"" + name + "\"}";
-            wsClient.SendText(msg);
+            if (!IsConnected || cameraCapture == null || !cameraCapture.IsReady)
+            {
+                ReportError("Physical camera or server is not ready.");
+                return;
+            }
+            if (sessionReady || (SessionId != null && !stopAcknowledged) || reconstructionRunning)
+            {
+                ReportError("A session is already active.");
+                return;
+            }
+            SessionId = null;
+            stopRequested = stopQueued = stopAcknowledged = false;
+            FramesSent = FramesAccepted = FramesDropped = 0;
+            var command = new ClientCommand { action = "start_session", name = name };
+            if (hasSelection)
+                command.roi = new SelectionData { center = selectionCenter, radius = selectionRadius };
+            EnqueueText(JsonUtility.ToJson(command));
         }
 
         public void StopSession()
         {
-            if (!IsConnected) return;
-
-            // Stop capturing first
-            if (cameraCapture != null) cameraCapture.StopCapturing();
-
-            string msg = "{\"action\":\"stop_session\"}";
-            wsClient.SendText(msg);
+            cameraCapture?.StopCapturing();
+            if (!IsConnected || stopRequested) return;
+            stopRequested = true;
+            if (sessionReady && !isSending)
+                StartCoroutine(ProcessSendQueue());
         }
 
-        // =========================================================
-        // Frame Handling
-        // =========================================================
+        public void RequestReconstruction(string method = "colmap")
+        {
+            if (IsConnected && SessionId != null)
+                EnqueueText(JsonUtility.ToJson(new ClientCommand { action = "start_reconstruction", method = method }));
+        }
+
+        private void Update()
+        {
+            if (reconstructionRunning && IsConnected && Time.unscaledTime >= nextStatusPoll)
+            {
+                EnqueueText(JsonUtility.ToJson(new ClientCommand { action = "get_reconstruction_status" }));
+                nextStatusPoll = Time.unscaledTime + 2f;
+            }
+        }
 
         private void OnFrameCaptured(CameraCapture.CapturedFrame frame)
         {
-            if (!IsConnected || wsClient == null) return;
-
-            // Get depth data
-            byte[] depthData = new byte[0];
-            if (depthCapture != null)
-                depthData = depthCapture.GetDepthData();
-
-            // Build binary frame
-            byte[] binaryFrame = BuildBinaryFrame(frame, depthData);
-
-            if (sendQueue.Count < maxQueueSize)
+            if (!IsConnected || !sessionReady || stopRequested) return;
+            if (sendQueue.Count >= maxQueueSize)
             {
-                sendQueue.Enqueue(binaryFrame);
-                if (!isSending)
-                    StartCoroutine(ProcessSendQueue());
+                FramesDropped++;
+                cameraCapture.StopCapturing();
+                ReportError("Network queue is full; capture stopped before losing more frames.");
+                StopSession();
+                return;
             }
+            var meta = new FrameMetadata
+            {
+                frame_index = frame.frameIndex,
+                camera_timestamp = frame.cameraTimestamp,
+                camera_id = frame.cameraId,
+                image_width = frame.imageWidth,
+                image_height = frame.imageHeight,
+                intrinsics = new IntrinsicsData { fx = frame.fx, fy = frame.fy, cx = frame.cx, cy = frame.cy },
+                pose = new PoseData { position = frame.position, rotation = frame.rotation }
+            };
+            byte[] metadata = Encoding.UTF8.GetBytes(JsonUtility.ToJson(meta));
+            using (var stream = new MemoryStream(16 + metadata.Length + frame.imageData.Length))
+            using (var writer = new BinaryWriter(stream))
+            {
+                writer.Write(new byte[] { (byte)'M', (byte)'S', (byte)'F', (byte)'2' });
+                writer.Write((uint)metadata.Length);
+                writer.Write((uint)frame.imageData.Length);
+                writer.Write((uint)0); // No uncalibrated Environment Depth.
+                writer.Write(metadata);
+                writer.Write(frame.imageData);
+                sendQueue.Enqueue(new OutgoingMessage { payload = stream.ToArray(), type = WebSocketMessageType.Binary, frame = true });
+            }
+            if (!isSending) StartCoroutine(ProcessSendQueue());
         }
 
-        private byte[] BuildBinaryFrame(CameraCapture.CapturedFrame frame, byte[] depthData)
+        private void EnqueueText(string message)
         {
-            // Pose data: 7 floats (px, py, pz, qx, qy, qz, qw)
-            byte[] poseBytes = new byte[28];
-            Buffer.BlockCopy(BitConverter.GetBytes(frame.position.x), 0, poseBytes, 0, 4);
-            Buffer.BlockCopy(BitConverter.GetBytes(frame.position.y), 0, poseBytes, 4, 4);
-            Buffer.BlockCopy(BitConverter.GetBytes(frame.position.z), 0, poseBytes, 8, 4);
-            Buffer.BlockCopy(BitConverter.GetBytes(frame.rotation.x), 0, poseBytes, 12, 4);
-            Buffer.BlockCopy(BitConverter.GetBytes(frame.rotation.y), 0, poseBytes, 16, 4);
-            Buffer.BlockCopy(BitConverter.GetBytes(frame.rotation.z), 0, poseBytes, 20, 4);
-            Buffer.BlockCopy(BitConverter.GetBytes(frame.rotation.w), 0, poseBytes, 24, 4);
-
-            // Intrinsics data: 4 floats (fx, fy, cx, cy)
-            byte[] intrinsicsBytes = new byte[16];
-            Buffer.BlockCopy(BitConverter.GetBytes(frame.fx), 0, intrinsicsBytes, 0, 4);
-            Buffer.BlockCopy(BitConverter.GetBytes(frame.fy), 0, intrinsicsBytes, 4, 4);
-            Buffer.BlockCopy(BitConverter.GetBytes(frame.cx), 0, intrinsicsBytes, 8, 4);
-            Buffer.BlockCopy(BitConverter.GetBytes(frame.cy), 0, intrinsicsBytes, 12, 4);
-
-            int imageLen = frame.imageData.Length;
-            int depthLen = depthData.Length;
-            int poseLen = poseBytes.Length;
-            int intrinsicsLen = intrinsicsBytes.Length;
-
-            int totalLen = HEADER_SIZE + imageLen + depthLen + poseLen + intrinsicsLen;
-            byte[] buffer = new byte[totalLen];
-            int offset = 0;
-
-            // Header
-            Buffer.BlockCopy(FRAME_MAGIC, 0, buffer, offset, 4); offset += 4;
-            Buffer.BlockCopy(BitConverter.GetBytes((uint)frame.frameIndex), 0, buffer, offset, 4); offset += 4;
-            Buffer.BlockCopy(BitConverter.GetBytes(frame.timestamp), 0, buffer, offset, 8); offset += 8;
-            Buffer.BlockCopy(BitConverter.GetBytes((uint)imageLen), 0, buffer, offset, 4); offset += 4;
-            Buffer.BlockCopy(BitConverter.GetBytes((uint)depthLen), 0, buffer, offset, 4); offset += 4;
-            Buffer.BlockCopy(BitConverter.GetBytes((uint)poseLen), 0, buffer, offset, 4); offset += 4;
-            Buffer.BlockCopy(BitConverter.GetBytes((uint)intrinsicsLen), 0, buffer, offset, 4); offset += 4;
-
-            // Data segments
-            Buffer.BlockCopy(frame.imageData, 0, buffer, offset, imageLen); offset += imageLen;
-            if (depthLen > 0)
+            sendQueue.Enqueue(new OutgoingMessage
             {
-                Buffer.BlockCopy(depthData, 0, buffer, offset, depthLen); offset += depthLen;
-            }
-            Buffer.BlockCopy(poseBytes, 0, buffer, offset, poseLen); offset += poseLen;
-            Buffer.BlockCopy(intrinsicsBytes, 0, buffer, offset, intrinsicsLen);
-
-            return buffer;
+                payload = Encoding.UTF8.GetBytes(message), type = WebSocketMessageType.Text
+            });
+            if (!isSending) StartCoroutine(ProcessSendQueue());
         }
 
         private IEnumerator ProcessSendQueue()
         {
             isSending = true;
-
-            while (sendQueue.Count > 0 && IsConnected)
+            while (IsConnected)
             {
-                byte[] data = sendQueue.Dequeue();
-                wsClient.SendBinary(data);
-                FramesSent++;
-                yield return null; // Yield one frame between sends
+                if (sendQueue.Count == 0 && stopRequested && sessionReady && !stopQueued)
+                {
+                    stopQueued = true;
+                    sendQueue.Enqueue(new OutgoingMessage
+                    {
+                        payload = Encoding.UTF8.GetBytes("{\"action\":\"stop_session\"}"),
+                        type = WebSocketMessageType.Text
+                    });
+                }
+                if (sendQueue.Count == 0) break;
+                var outgoing = sendQueue.Dequeue();
+                Task send = wsClient.Send(outgoing.payload, outgoing.type);
+                float deadline = Time.realtimeSinceStartup + 30f;
+                while (!send.IsCompleted && Time.realtimeSinceStartup < deadline)
+                    yield return null;
+                if (!send.IsCompleted || send.IsFaulted || send.IsCanceled)
+                {
+                    ReportError("WebSocket send failed or timed out: " + send.Exception?.GetBaseException().Message);
+                    Disconnect();
+                    break;
+                }
+                if (outgoing.frame) FramesSent++;
             }
-
             isSending = false;
         }
 
-        // =========================================================
-        // Message Handling
-        // =========================================================
-
-        private void HandleMessage(string message)
+        private void HandleMessage(string json)
         {
-            try
+            ServerMessage message;
+            try { message = JsonUtility.FromJson<ServerMessage>(json); }
+            catch (Exception exc) { ReportError("Invalid server JSON: " + exc.Message); return; }
+            if (message == null) return;
+            switch (message.action)
             {
-                // Simple JSON parsing without external dependencies
-                if (message.Contains("\"action\""))
-                {
-                    if (message.Contains("\"session_started\""))
+                case "session_started":
+                    SessionId = message.session_id;
+                    sessionReady = true;
+                    OnSessionStarted?.Invoke(SessionId);
+                    if (stopRequested && !isSending) StartCoroutine(ProcessSendQueue());
+                    else cameraCapture?.StartCapturing();
+                    break;
+                case "frame_result":
+                    FramesAccepted = message.total_frames;
+                    OnFrameFeedback?.Invoke(new FrameFeedback
                     {
-                        // Extract session_id
-                        int idStart = message.IndexOf("\"session_id\"") + 14;
-                        int idEnd = message.IndexOf("\"", idStart);
-                        if (idStart > 13 && idEnd > idStart)
-                        {
-                            SessionId = message.Substring(idStart, idEnd - idStart);
-                            OnSessionStarted?.Invoke(SessionId);
-                        }
-                    }
-                    else if (message.Contains("\"frame_result\""))
-                    {
-                        FrameFeedback feedback = ParseFrameFeedback(message);
-                        if (feedback != null)
-                            OnFrameFeedback?.Invoke(feedback);
-                    }
-                    else if (message.Contains("\"session_stopped\""))
-                    {
-                        Debug.Log("[MetaScan-Stream] Session stopped by server");
-                    }
-                    else if (message.Contains("\"error\""))
-                    {
-                        int msgStart = message.IndexOf("\"message\"") + 11;
-                        int msgEnd = message.IndexOf("\"", msgStart);
-                        if (msgStart > 10 && msgEnd > msgStart)
-                        {
-                            string errorMsg = message.Substring(msgStart, msgEnd - msgStart);
-                            OnError?.Invoke(errorMsg);
-                        }
-                    }
-                    else if (message.Contains("\"pong\""))
-                    {
-                        // Heartbeat response, no action needed
-                    }
-                }
-            }
-            catch (Exception e)
-            {
-                Debug.LogError($"[MetaScan-Stream] Message parse error: {e.Message}");
+                        status = message.status, total_frames = message.total_frames,
+                        quality_ok = message.quality_ok,
+                        quality_issues = message.quality_issues
+                    });
+                    break;
+                case "session_stopped":
+                    sessionReady = false;
+                    stopAcknowledged = true;
+                    FramesAccepted = message.total_frames;
+                    OnSessionStopped?.Invoke(message.total_frames, message.ready_for_reconstruction);
+                    break;
+                case "reconstruction_started":
+                    reconstructionRunning = true;
+                    nextStatusPoll = 0f;
+                    OnReconstructionStatus?.Invoke("running", "Starting reconstruction");
+                    break;
+                case "reconstruction_status":
+                    OnReconstructionStatus?.Invoke(message.status, message.step ?? message.error);
+                    if (message.status == "completed" || message.status == "failed" ||
+                        message.status == "interrupted")
+                        reconstructionRunning = false;
+                    break;
+                case "error":
+                    ReportError(message.message);
+                    break;
             }
         }
 
-        private FrameFeedback ParseFrameFeedback(string json)
+        private void ReportError(string message)
         {
-            FrameFeedback fb = new FrameFeedback();
-
-            // status
-            fb.status = ExtractJsonString(json, "status");
-
-            // total_frames
-            string framesStr = ExtractJsonValue(json, "total_frames");
-            if (int.TryParse(framesStr, out int frames))
-                fb.total_frames = frames;
-
-            // quality_ok
-            string qualityStr = ExtractJsonValue(json, "quality_ok");
-            fb.quality_ok = qualityStr == "true";
-
-            // quality_issues (simplified — extract first issue)
-            fb.quality_issues = new string[0];
-            int issuesStart = json.IndexOf("\"quality_issues\"");
-            if (issuesStart >= 0)
-            {
-                int arrStart = json.IndexOf("[", issuesStart);
-                int arrEnd = json.IndexOf("]", arrStart);
-                if (arrStart >= 0 && arrEnd > arrStart)
-                {
-                    string arrContent = json.Substring(arrStart + 1, arrEnd - arrStart - 1).Trim();
-                    if (arrContent.Length > 0)
-                    {
-                        string[] parts = arrContent.Split(',');
-                        fb.quality_issues = new string[parts.Length];
-                        for (int i = 0; i < parts.Length; i++)
-                        {
-                            fb.quality_issues[i] = parts[i].Trim().Trim('"');
-                        }
-                    }
-                }
-            }
-
-            return fb;
-        }
-
-        private string ExtractJsonString(string json, string key)
-        {
-            string searchKey = "\"" + key + "\"";
-            int keyIdx = json.IndexOf(searchKey);
-            if (keyIdx < 0) return "";
-
-            int colonIdx = json.IndexOf(":", keyIdx + searchKey.Length);
-            if (colonIdx < 0) return "";
-
-            int valueStart = json.IndexOf("\"", colonIdx + 1);
-            if (valueStart < 0) return "";
-
-            int valueEnd = json.IndexOf("\"", valueStart + 1);
-            if (valueEnd < 0) return "";
-
-            return json.Substring(valueStart + 1, valueEnd - valueStart - 1);
-        }
-
-        private string ExtractJsonValue(string json, string key)
-        {
-            string searchKey = "\"" + key + "\"";
-            int keyIdx = json.IndexOf(searchKey);
-            if (keyIdx < 0) return "";
-
-            int colonIdx = json.IndexOf(":", keyIdx + searchKey.Length);
-            if (colonIdx < 0) return "";
-
-            int start = colonIdx + 1;
-            while (start < json.Length && (json[start] == ' ' || json[start] == '\t'))
-                start++;
-
-            int end = start;
-            while (end < json.Length && json[end] != ',' && json[end] != '}' && json[end] != ']' && json[end] != ' ')
-                end++;
-
-            return json.Substring(start, end - start).Trim('"');
+            Debug.LogError("[MetaScan-Stream] " + message);
+            OnError?.Invoke(message);
         }
 
         private void OnDestroy()
         {
             Disconnect();
             if (cameraCapture != null)
+            {
                 cameraCapture.OnFrameCaptured -= OnFrameCaptured;
+                cameraCapture.OnCaptureError -= ReportError;
+            }
         }
     }
 
-    // =========================================================
-    // Minimal WebSocket Client (Unity-compatible)
-    // =========================================================
-
-    public class WebSocketClient
+    public sealed class WebSocketClient
     {
-        private System.Net.WebSockets.ClientWebSocket ws;
-        private bool isConnected;
-        private byte[] receiveBuffer = new byte[65536];
+        private ClientWebSocket socket;
+        private CancellationTokenSource cancellation;
+        private bool closed;
+        private const int MaxMessageBytes = 1024 * 1024;
 
-        private Action onOpen;
-        private Action<string> onMessage;
-        private Action<string> onError;
-        private Action<string> onClose;
-
-        public IEnumerator Connect(string url,
-            Action onOpen, Action<string> onMessage,
+        public IEnumerator Connect(string url, Action onOpen, Action<string> onMessage,
             Action<string> onError, Action<string> onClose)
         {
-            this.onOpen = onOpen;
-            this.onMessage = onMessage;
-            this.onError = onError;
-            this.onClose = onClose;
-
-            ws = new System.Net.WebSockets.ClientWebSocket();
-
-            var connectTask = ws.ConnectAsync(new Uri(url), System.Threading.CancellationToken.None);
-
-            while (!connectTask.IsCompleted)
+            socket = new ClientWebSocket();
+            cancellation = new CancellationTokenSource();
+            Task connect = socket.ConnectAsync(new Uri(url), cancellation.Token);
+            float deadline = Time.realtimeSinceStartup + 30f;
+            while (!connect.IsCompleted && Time.realtimeSinceStartup < deadline)
                 yield return null;
-
-            if (connectTask.IsFaulted)
+            if (!connect.IsCompleted || connect.IsFaulted || connect.IsCanceled)
             {
-                onError?.Invoke(connectTask.Exception?.InnerException?.Message ?? "Connection failed");
+                onError?.Invoke("Connection failed: " + (connect.Exception?.ToString() ?? "timeout or cancellation"));
+                Close();
                 yield break;
             }
-
-            isConnected = true;
             onOpen?.Invoke();
-
-            // Start receiving
-            var receiveCoroutine = ReceiveLoop();
-            while (receiveCoroutine.MoveNext())
-                yield return receiveCoroutine.Current;
-        }
-
-        private IEnumerator ReceiveLoop()
-        {
-            while (isConnected && ws.State == System.Net.WebSockets.WebSocketState.Open)
+            byte[] buffer = new byte[8192];
+            using (var message = new MemoryStream())
             {
-                var buffer = new ArraySegment<byte>(receiveBuffer);
-                var receiveTask = ws.ReceiveAsync(buffer, System.Threading.CancellationToken.None);
-
-                while (!receiveTask.IsCompleted)
-                    yield return null;
-
-                if (receiveTask.IsFaulted)
+                while (!closed && socket.State == WebSocketState.Open)
                 {
-                    onError?.Invoke(receiveTask.Exception?.InnerException?.Message ?? "Receive error");
-                    break;
-                }
-
-                var result = receiveTask.Result;
-
-                if (result.MessageType == System.Net.WebSockets.WebSocketMessageType.Close)
-                {
-                    isConnected = false;
-                    onClose?.Invoke("Server closed connection");
-                    break;
-                }
-
-                if (result.MessageType == System.Net.WebSockets.WebSocketMessageType.Text)
-                {
-                    string message = Encoding.UTF8.GetString(receiveBuffer, 0, result.Count);
-                    onMessage?.Invoke(message);
+                    Task<WebSocketReceiveResult> receive = socket.ReceiveAsync(
+                        new ArraySegment<byte>(buffer), cancellation.Token);
+                    while (!receive.IsCompleted) yield return null;
+                    if (receive.IsFaulted || receive.IsCanceled)
+                    {
+                        if (!closed) onError?.Invoke("Receive failed: " + receive.Exception?.GetBaseException().Message);
+                        break;
+                    }
+                    var result = receive.Result;
+                    if (result.MessageType == WebSocketMessageType.Close) break;
+                    if (result.MessageType != WebSocketMessageType.Text || message.Length + result.Count > MaxMessageBytes)
+                    {
+                        onError?.Invoke("Unsupported or oversized server message.");
+                        break;
+                    }
+                    message.Write(buffer, 0, result.Count);
+                    if (result.EndOfMessage)
+                    {
+                        onMessage?.Invoke(Encoding.UTF8.GetString(message.ToArray()));
+                        message.SetLength(0);
+                    }
                 }
             }
+            Close();
+            onClose?.Invoke("Connection closed");
         }
 
-        public void SendText(string text)
+        public Task Send(byte[] data, WebSocketMessageType type)
         {
-            if (!isConnected || ws == null) return;
-            byte[] data = Encoding.UTF8.GetBytes(text);
-            var segment = new ArraySegment<byte>(data);
-            ws.SendAsync(segment, System.Net.WebSockets.WebSocketMessageType.Text,
-                true, System.Threading.CancellationToken.None);
-        }
-
-        public void SendBinary(byte[] data)
-        {
-            if (!isConnected || ws == null) return;
-            var segment = new ArraySegment<byte>(data);
-            ws.SendAsync(segment, System.Net.WebSockets.WebSocketMessageType.Binary,
-                true, System.Threading.CancellationToken.None);
+            if (closed || socket == null || socket.State != WebSocketState.Open)
+                return Task.FromException(new InvalidOperationException("WebSocket is closed"));
+            return socket.SendAsync(new ArraySegment<byte>(data), type, true, cancellation.Token);
         }
 
         public void Close()
         {
-            isConnected = false;
-            if (ws != null && ws.State == System.Net.WebSockets.WebSocketState.Open)
-            {
-                ws.CloseAsync(System.Net.WebSockets.WebSocketCloseStatus.NormalClosure,
-                    "Client closing", System.Threading.CancellationToken.None);
-            }
+            if (closed) return;
+            closed = true;
+            cancellation?.Cancel();
+            socket?.Abort();
+            socket?.Dispose();
+            cancellation?.Dispose();
         }
     }
 }

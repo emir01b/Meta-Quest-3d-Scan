@@ -19,6 +19,8 @@ namespace MetaScan
         [Header("Selection Settings")]
         [SerializeField] private float minRadius = 0.05f;
         [SerializeField] private float maxRadius = 2.0f;
+        [SerializeField] private float defaultRadius = 0.24f;
+        [SerializeField] private float dragDeadZone = 0.02f;
         [SerializeField] private Color selectionColor = new Color(1.0f, 0.6f, 0.0f, 0.4f);
         [SerializeField] private Color confirmedColor = new Color(0.2f, 0.9f, 0.4f, 0.3f);
         [SerializeField] private int sphereSegments = 32;
@@ -61,7 +63,7 @@ namespace MetaScan
             isDragging = false;
 
             currentSelectionDistance = 0.8f;
-            SelectionRadius = 0.15f; // Varsayılan 15cm önizleme boyutu
+            SelectionRadius = Mathf.Clamp(defaultRadius, minRadius, maxRadius);
 
             if (controllerManager != null)
             {
@@ -121,7 +123,9 @@ namespace MetaScan
             // Tetik basıldığında küre merkezini mevcut hizalanmış konumda kilitler
             dragStartPoint = SelectionCenter;
             isDragging = true;
-            SelectionRadius = minRadius;
+            // A short click confirms the sphere the user can already see.
+            // Resetting to minRadius here made a 24 cm preview become a 5 cm scan ROI.
+            SelectionRadius = Mathf.Clamp(defaultRadius, minRadius, maxRadius);
 
             SetVisualsActive(true);
             UpdateVisualTransform();
@@ -191,7 +195,7 @@ namespace MetaScan
                         SelectionCenter = cam.transform.position + cam.transform.forward * currentSelectionDistance;
                 }
 
-                SelectionRadius = 0.15f; // Sürükleme öncesi sabit önizleme boyutu
+                SelectionRadius = Mathf.Clamp(defaultRadius, minRadius, maxRadius);
                 UpdateVisualTransform();
             }
             else
@@ -213,7 +217,9 @@ namespace MetaScan
                 }
 
                 float dist = Vector3.Distance(dragStartPoint, currentPoint);
-                SelectionRadius = Mathf.Clamp(dist, minRadius, maxRadius);
+                SelectionRadius = dist <= dragDeadZone
+                    ? Mathf.Clamp(defaultRadius, minRadius, maxRadius)
+                    : Mathf.Clamp(dist, minRadius, maxRadius);
                 SelectionCenter = dragStartPoint; // Merkez kilitli kalır
                 UpdateVisualTransform();
             }

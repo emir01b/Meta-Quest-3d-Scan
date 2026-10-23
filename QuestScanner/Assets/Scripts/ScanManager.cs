@@ -13,13 +13,11 @@ namespace MetaScan
     {
         [Header("Components (Auto-found if empty)")]
         [SerializeField] private CameraCapture cameraCapture;
-        [SerializeField] private DepthCapture depthCapture;
         [SerializeField] private DataStreamer dataStreamer;
         [SerializeField] private ControllerManager controllerManager;
         [SerializeField] private HandUIManager handUIManager;
         [SerializeField] private ScanPointer scanPointer;
         [SerializeField] private ObjectSelector objectSelector;
-        [SerializeField] private PointCloudVisualizer pointCloudVisualizer;
 
         [Header("Scan Settings")]
         [SerializeField] private int minFramesRequired = 30;
@@ -52,13 +50,11 @@ namespace MetaScan
         private void FindComponents()
         {
             if (cameraCapture == null) cameraCapture = FindFirstObjectByType<CameraCapture>();
-            if (depthCapture == null) depthCapture = FindFirstObjectByType<DepthCapture>();
             if (dataStreamer == null) dataStreamer = FindFirstObjectByType<DataStreamer>();
             if (controllerManager == null) controllerManager = FindFirstObjectByType<ControllerManager>();
             if (handUIManager == null) handUIManager = FindFirstObjectByType<HandUIManager>();
             if (scanPointer == null) scanPointer = FindFirstObjectByType<ScanPointer>();
             if (objectSelector == null) objectSelector = FindFirstObjectByType<ObjectSelector>();
-            if (pointCloudVisualizer == null) pointCloudVisualizer = FindFirstObjectByType<PointCloudVisualizer>();
 
             // Find head transform
 #if META_XR_SDK
@@ -80,6 +76,8 @@ namespace MetaScan
                 dataStreamer.OnConnected += OnServerConnected;
                 dataStreamer.OnDisconnected += OnServerDisconnected;
                 dataStreamer.OnSessionStarted += OnSessionStarted;
+                dataStreamer.OnSessionStopped += OnSessionStopped;
+                dataStreamer.OnReconstructionStatus += OnReconstructionStatus;
                 dataStreamer.OnFrameFeedback += OnFrameFeedback;
                 dataStreamer.OnError += OnServerError;
             }
@@ -145,7 +143,7 @@ namespace MetaScan
 
                 case ScanState.Selecting:
                     handUIManager.SetStatus("Cisim Secimi", selectColor);
-                    handUIManager.SetInstruction("Sag tetik ile nesneye isaret edip basili tutun, surukleyerek alani belirleyin");
+                    handUIManager.SetInstruction("Kure nesneyi tamamen sarmali. Sag cubuk: derinlik; tetigi basili tutup surukle: boyut; kisa tikla: gorunen boyutu sec.");
                     handUIManager.SetSelectButtonEnabled(true); // Yeniden secime izin ver
                     handUIManager.SetScanButtonsState(false, true); // Dur (Iptal) butonunu aktif et
                     handUIManager.SetStopButtonText("Iptal");
@@ -211,8 +209,6 @@ namespace MetaScan
             SetState(ScanState.Selecting);
             if (objectSelector != null)
                 objectSelector.StartSelecting();
-            if (pointCloudVisualizer != null)
-                pointCloudVisualizer.ClearPoints();
         }
 
         private void OnObjectSelected(Vector3 center, float radius)
@@ -222,7 +218,7 @@ namespace MetaScan
             {
                 handUIManager.SetStatus("Cisim Secildi", goodColor);
                 handUIManager.SetInstruction(
-                    $"Alan secildi (r={radius:F2}m). Taramayi Baslat'a basin.");
+                    $"Alan secildi (cap={radius * 2f:F2}m). Nesne tamamen icindeyse Taramayi Baslat'a basin.");
                 handUIManager.SetSelectButtonEnabled(true); // Yeniden secime izin ver
                 handUIManager.SetScanButtonsState(true, true); // Taramayi baslat aktif, iptal aktif
                 handUIManager.SetStopButtonText("Iptal");
@@ -239,14 +235,17 @@ namespace MetaScan
 
         private void OnScanRequested()
         {
+            if (cameraCapture == null || !cameraCapture.IsReady || dataStreamer == null || !dataStreamer.IsConnected)
+            {
+                OnServerError("Fiziksel kamera veya sunucu hazir degil.");
+                return;
+            }
             SetState(ScanState.Scanning);
             scanStartTime = Time.time;
-
-            // Start camera capture
-            if (cameraCapture != null) cameraCapture.StartCapturing();
-
-            // Start streaming session
-            dataStreamer.StartSession("scan");
+            bool hasSelection = objectSelector != null && objectSelector.HasSelection;
+            dataStreamer.StartSession("scan", hasSelection,
+                hasSelection ? objectSelector.SelectionCenter : Vector3.zero,
+                hasSelection ? objectSelector.SelectionRadius : 0f);
         }
 
         private void OnStopRequested()
@@ -268,20 +267,9 @@ namespace MetaScan
             if (cameraCapture != null) cameraCapture.StopCapturing();
             dataStreamer.StopSession();
 
-            if (dataStreamer.FramesSent >= minFramesRequired)
-            {
-                SetState(ScanState.Processing);
-                if (handUIManager != null)
-                    handUIManager.SetInstruction(
-                        dataStreamer.FramesSent + " frame kaydedildi. 3D model olusturuluyor...");
-            }
-            else
-            {
-                if (handUIManager != null)
-                    handUIManager.SetInstruction(
-                        "Yetersiz frame (" + dataStreamer.FramesSent + "/" + minFramesRequired + ").");
-                SetState(ScanState.Connected);
-            }
+            SetState(ScanState.Processing);
+            if (handUIManager != null)
+                handUIManager.SetInstruction("Son kareler sunucuda kaydediliyor...");
         }
 
         // ================== Server Events ==================
@@ -303,6 +291,31 @@ namespace MetaScan
             Debug.Log("[MetaScan-Manager] Session: " + id);
         }
 
+        private void OnSessionStopped(int acceptedFrames, bool ready)
+        {
+            if (CurrentState == ScanState.Error) return;
+            if (ready && acceptedFrames >= minFramesRequired)
+            {
+                SetState(ScanState.Processing);
+                dataStreamer.RequestReconstruction("colmap");
+            }
+            else
+            {
+                SetState(ScanState.Connected);
+                if (handUIManager != null)
+                    handUIManager.SetInstruction("Yetersiz kayitli kare: " + acceptedFrames);
+            }
+        }
+
+        private void OnReconstructionStatus(string status, string detail)
+        {
+            if (status == "completed") SetState(ScanState.Complete);
+            else if (status == "failed" || status == "interrupted")
+                OnServerError("Rekonstruksiyon durdu: " + detail);
+            else if (handUIManager != null)
+                handUIManager.SetInstruction("Isleniyor: " + detail);
+        }
+
         private void OnFrameFeedback(DataStreamer.FrameFeedback fb)
         {
             if (handUIManager == null) return;
@@ -322,8 +335,6 @@ namespace MetaScan
                 handUIManager.SetQuality("Kalite: " + issues, badColor);
             }
 
-            // Add visualization points
-            AddPointsFromFrame(fb.quality_ok);
 
             if (fb.total_frames >= targetFrames)
             {
@@ -337,63 +348,12 @@ namespace MetaScan
         private void OnServerError(string err)
         {
             Debug.LogError("[MetaScan-Manager] Error: " + err);
+            cameraCapture?.StopCapturing();
+            if (dataStreamer != null && dataStreamer.IsConnected)
+                dataStreamer.StopSession();
             if (handUIManager != null)
                 handUIManager.SetInstruction("Hata: " + err);
             SetState(ScanState.Error);
-        }
-
-        // ================== Point Cloud ==================
-
-        private void AddPointsFromFrame(bool qualityOk)
-        {
-            if (pointCloudVisualizer == null || headTransform == null) return;
-
-            // Önce gerçek depth verisi ile dene
-            bool usedRealDepth = false;
-
-            if (depthCapture != null && depthCapture.IsDepthAvailable
-                && depthCapture.DepthWidth > 0 && depthCapture.DepthHeight > 0)
-            {
-                byte[] depthData = depthCapture.GetLastDepthData();
-                if (depthData != null && depthData.Length > 0 && cameraCapture != null)
-                {
-                    // Intrinsics'i al (CameraCapture'dan)
-                    float fx = cameraCapture.FocalLengthX;
-                    float fy = cameraCapture.FocalLengthY;
-                    float cx = cameraCapture.PrincipalPointX;
-                    float cy = cameraCapture.PrincipalPointY;
-
-                    // Depth boyutlarına göre intrinsics'i ölçekle
-                    // (CameraCapture intrinsics captureWidth/Height'a göre,
-                    //  ama depth farklı çözünürlükte olabilir)
-                    float scaleX = (float)depthCapture.DepthWidth / 1280f;
-                    float scaleY = (float)depthCapture.DepthHeight / 960f;
-
-                    pointCloudVisualizer.AddDepthPoints(
-                        depthData,
-                        depthCapture.DepthWidth,
-                        depthCapture.DepthHeight,
-                        fx * scaleX, fy * scaleY,
-                        cx * scaleX, cy * scaleY,
-                        headTransform.position,
-                        headTransform.rotation
-                    );
-                    usedRealDepth = true;
-                }
-            }
-
-            // Depth yoksa fallback: rastgele saçılım
-            if (!usedRealDepth)
-            {
-                float hitDist = 0f;
-                if (scanPointer != null && scanPointer.HasHit)
-                    hitDist = scanPointer.GetHitDistance();
-
-                pointCloudVisualizer.AddFramePoints(
-                    headTransform.position, headTransform.forward,
-                    headTransform.right, headTransform.up,
-                    qualityOk, hitDist);
-            }
         }
 
         // ================== Update ==================
@@ -416,6 +376,8 @@ namespace MetaScan
                 dataStreamer.OnConnected -= OnServerConnected;
                 dataStreamer.OnDisconnected -= OnServerDisconnected;
                 dataStreamer.OnSessionStarted -= OnSessionStarted;
+                dataStreamer.OnSessionStopped -= OnSessionStopped;
+                dataStreamer.OnReconstructionStatus -= OnReconstructionStatus;
                 dataStreamer.OnFrameFeedback -= OnFrameFeedback;
                 dataStreamer.OnError -= OnServerError;
             }

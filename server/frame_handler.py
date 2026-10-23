@@ -1,11 +1,12 @@
-"""
-MetaScan — Frame Handler
-Processes binary frames from Quest 3S, performs quality checks,
-and stores data for 3D reconstruction.
-"""
+"""Validate and durably store physical-camera frames without altering source data."""
+
 import json
+import hashlib
 import logging
-import struct
+import math
+import os
+import re
+import shutil
 import time
 from pathlib import Path
 
@@ -13,393 +14,170 @@ import cv2
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from config import (
-    FRAME_MAGIC, FRAME_HEADER_SIZE,
-    BLUR_THRESHOLD, EXPOSURE_MIN, EXPOSURE_MAX,
-    SESSIONS_DIR, CAMERA_WIDTH, CAMERA_HEIGHT,
-    COLMAP_CAMERA_MODEL
-)
+from config import BLUR_THRESHOLD, EXPOSURE_MIN, EXPOSURE_MAX, SESSIONS_DIR
+from protocol import ProtocolError, parse_frame
 
 logger = logging.getLogger("metascan.frame_handler")
 
 
-class FrameHandler:
-    """Handles incoming binary frames from Quest 3S."""
+def atomic_write(path: Path, data: bytes):
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("wb") as stream:
+        stream.write(data)
+        stream.flush()
+        os.fsync(stream.fileno())
+    temporary.replace(path)
 
-    def __init__(self, session_id: str):
+
+class FrameHandler:
+    def __init__(self, session_id: str, root_dir: Path = SESSIONS_DIR, roi=None):
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,96}", session_id):
+            raise ValueError("invalid session id")
         self.session_id = session_id
-        self.session_dir = SESSIONS_DIR / session_id
+        self.session_dir = root_dir / session_id
         self.images_dir = self.session_dir / "images"
         self.depth_dir = self.session_dir / "depth"
         self.poses_dir = self.session_dir / "poses"
-
-        # Create directories
-        for d in [self.images_dir, self.depth_dir, self.poses_dir]:
-            d.mkdir(parents=True, exist_ok=True)
-
+        for path in (self.images_dir, self.depth_dir, self.poses_dir):
+            path.mkdir(parents=True, exist_ok=True)
+        self.start_time = time.time()
         self.frame_count = 0
         self.accepted_frames = 0
         self.rejected_frames = 0
-        self.start_time = time.time()
-        self.frame_metadata: list[dict] = []
-
-        # Camera intrinsics (updated from first frame)
+        self.frame_metadata = []
         self.intrinsics = None
-
-        logger.info(f"FrameHandler initialized for session: {session_id}")
+        self.camera_id = None
+        self.roi = roi
+        self.finalized = False
+        self.seen_indices = set()
+        self.seen_timestamps = set()
 
     def process_frame(self, raw_data: bytes) -> dict:
-        """
-        Parse and process a binary frame from Quest 3S.
-
-        Returns dict with frame result info.
-        """
+        if self.finalized:
+            return self._reject("session_finalized")
+        self.frame_count += 1
         try:
-            # Parse header
-            frame_data = self._parse_binary_frame(raw_data)
-            if frame_data is None:
-                return {
-                    "status": "error",
-                    "message": "Invalid frame format",
-                    "total_frames": self.accepted_frames,
-                }
-
-            frame_index = frame_data["frame_index"]
-            timestamp = frame_data["timestamp"]
-            image_bytes = frame_data["image_data"]
-            depth_bytes = frame_data["depth_data"]
-            pose_data = frame_data["pose_data"]
-            intrinsics_data = frame_data["intrinsics_data"]
-
-            self.frame_count += 1
-
-            # Decode image
-            img_array = np.frombuffer(image_bytes, dtype=np.uint8)
-            image = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-
-            if image is None:
-                self.rejected_frames += 1
-                return {
-                    "status": "rejected",
-                    "reason": "decode_failed",
-                    "total_frames": self.accepted_frames,
-                    "quality_ok": False,
-                    "quality_issues": ["Image decode failed"],
-                }
-
-            # Quality check
-            quality_ok, quality_issues = self._check_quality(image)
-
-            if not quality_ok:
-                logger.warning(f"Frame {frame_index} quality warning: {', '.join(quality_issues)} (Accepted due to bypass)")
-                quality_ok = True
-                quality_issues = []
-
-            # ── Image preprocessing for better COLMAP features ──
-            image = self._preprocess_image(image)
-
-            # Save image
-            img_filename = f"frame_{self.accepted_frames:06d}.jpg"
-            img_path = self.images_dir / img_filename
-            cv2.imwrite(str(img_path), image, [cv2.IMWRITE_JPEG_QUALITY, 95])
-
-            # Save depth map (if present)
-            depth_filename = None
-            if len(depth_bytes) > 0:
-                depth_filename = f"depth_{self.accepted_frames:06d}.raw"
-                depth_path = self.depth_dir / depth_filename
-                with open(depth_path, "wb") as f:
-                    f.write(depth_bytes)
-
-            # Parse and save pose
-            pose = self._parse_pose(pose_data)
-            if pose is not None:
-                pose_filename = f"pose_{self.accepted_frames:06d}.json"
-                pose_path = self.poses_dir / pose_filename
-                with open(pose_path, "w") as f:
-                    json.dump(pose, f, indent=2)
-
-            # Parse intrinsics (save once)
-            if self.intrinsics is None and len(intrinsics_data) >= 16:
-                fx, fy, cx, cy = struct.unpack("<4f", intrinsics_data[:16])
-                self.intrinsics = {
-                    "fx": fx, "fy": fy, "cx": cx, "cy": cy,
-                    "width": CAMERA_WIDTH, "height": CAMERA_HEIGHT,
-                    "model": COLMAP_CAMERA_MODEL,
-                }
-                intrinsics_path = self.session_dir / "intrinsics.json"
-                with open(intrinsics_path, "w") as f:
-                    json.dump(self.intrinsics, f, indent=2)
-                logger.info(f"Camera intrinsics saved: fx={fx:.1f}, fy={fy:.1f}")
-
-            # Store metadata
-            frame_meta = {
+            meta, image_bytes, _ = parse_frame(raw_data)
+            index = meta["frame_index"]
+            if index in self.seen_indices or meta["camera_timestamp"] in self.seen_timestamps:
+                return self._reject("duplicate_frame")
+            image = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)
+            if image is None or (image.shape[1], image.shape[0]) != (meta["image_width"], meta["image_height"]):
+                return self._reject("image_decode_or_dimensions")
+            intr = {**meta["intrinsics"], "width": image.shape[1], "height": image.shape[0], "model": "PINHOLE"}
+            if self.intrinsics is not None:
+                if meta["camera_id"] != self.camera_id or any(
+                    not math.isclose(intr[key], self.intrinsics[key], rel_tol=1e-5, abs_tol=1e-3)
+                    for key in ("fx", "fy", "cx", "cy", "width", "height")
+                ):
+                    return self._reject("camera_calibration_changed")
+            quality_ok, quality_issues, metrics = self._check_quality(image)
+            filename = f"frame_{index:06d}.jpg"
+            atomic_write(self.images_dir / filename, image_bytes)
+            if self.intrinsics is None:
+                self.intrinsics = intr
+                self.camera_id = meta["camera_id"]
+                atomic_write(self.session_dir / "intrinsics.json", json.dumps(intr, indent=2).encode("utf-8"))
+            frame = {
                 "index": self.accepted_frames,
-                "original_index": frame_index,
-                "timestamp": timestamp,
-                "image": img_filename,
-                "depth": depth_filename,
-                "pose": pose,
+                "original_index": index,
+                "camera_timestamp": meta["camera_timestamp"],
+                "camera_id": meta["camera_id"],
+                "image": filename,
+                "image_sha256": hashlib.sha256(image_bytes).hexdigest(),
+                "depth": None,
+                "pose": meta["pose"],
                 "quality_ok": quality_ok,
+                "quality_issues": quality_issues,
+                "quality_metrics": metrics,
+                "capture_metadata": meta,
             }
-            self.frame_metadata.append(frame_meta)
+            self.frame_metadata.append(frame)
             self.accepted_frames += 1
-
-            logger.debug(
-                f"Frame {self.accepted_frames} accepted "
-                f"(total: {self.frame_count}, rejected: {self.rejected_frames})"
-            )
-
+            self.seen_indices.add(index)
+            self.seen_timestamps.add(meta["camera_timestamp"])
             return {
-                "status": "accepted",
-                "frame_index": self.accepted_frames,
+                "status": "accepted", "frame_index": index,
                 "total_frames": self.accepted_frames,
-                "quality_ok": True,
-                "quality_issues": [],
+                "quality_ok": quality_ok, "quality_issues": quality_issues,
             }
+        except (ProtocolError, ValueError, cv2.error) as exc:
+            return self._reject(str(exc))
+        except OSError:
+            logger.exception("Frame storage failed")
+            return self._reject("storage_failed")
 
-        except Exception as e:
-            logger.error(f"Frame processing error: {e}", exc_info=True)
-            return {
-                "status": "error",
-                "message": str(e),
-                "total_frames": self.accepted_frames,
-            }
+    def _reject(self, reason):
+        self.rejected_frames += 1
+        logger.warning("Rejected scan frame: %s", reason)
+        return {"status": "rejected", "reason": reason, "total_frames": self.accepted_frames,
+                "quality_ok": False, "quality_issues": [reason]}
 
-    def _parse_binary_frame(self, data: bytes) -> dict | None:
-        """Parse binary frame protocol."""
-        if len(data) < FRAME_HEADER_SIZE:
-            logger.warning(f"Frame too small: {len(data)} bytes")
-            return None
-
-        # Check magic
-        magic = data[:4]
-        if magic != FRAME_MAGIC:
-            logger.warning(f"Invalid frame magic: {magic}")
-            return None
-
-        # Parse header
-        frame_index = struct.unpack("<I", data[4:8])[0]
-        timestamp = struct.unpack("<d", data[8:16])[0]
-        image_len = struct.unpack("<I", data[16:20])[0]
-        depth_len = struct.unpack("<I", data[20:24])[0]
-        pose_len = struct.unpack("<I", data[24:28])[0]
-        intrinsics_len = struct.unpack("<I", data[28:32])[0]
-
-        # Validate lengths
-        expected_total = FRAME_HEADER_SIZE + image_len + depth_len + pose_len + intrinsics_len
-        if len(data) < expected_total:
-            logger.warning(
-                f"Frame data too short: got {len(data)}, expected {expected_total}"
-            )
-            return None
-
-        # Extract segments
-        offset = FRAME_HEADER_SIZE
-        image_data = data[offset:offset + image_len]
-        offset += image_len
-        depth_data = data[offset:offset + depth_len]
-        offset += depth_len
-        pose_data = data[offset:offset + pose_len]
-        offset += pose_len
-        intrinsics_data = data[offset:offset + intrinsics_len]
-
-        return {
-            "frame_index": frame_index,
-            "timestamp": timestamp,
-            "image_data": image_data,
-            "depth_data": depth_data,
-            "pose_data": pose_data,
-            "intrinsics_data": intrinsics_data,
-        }
-
-    def _check_quality(self, image: np.ndarray) -> tuple[bool, list[str]]:
-        """Check image quality (blur, exposure)."""
+    @staticmethod
+    def _check_quality(image):
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        brightness = float(gray.mean())
         issues = []
+        if sharpness < BLUR_THRESHOLD:
+            issues.append("blurry")
+        if brightness < EXPOSURE_MIN:
+            issues.append("underexposed")
+        elif brightness > EXPOSURE_MAX:
+            issues.append("overexposed")
+        return not issues, issues, {"laplacian_variance": sharpness, "mean_brightness": brightness}
 
-        # Convert to grayscale for analysis
-        if len(image.shape) == 3:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = image
-
-        # Blur detection (Laplacian variance)
-        laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
-        if laplacian_var < BLUR_THRESHOLD:
-            issues.append(f"blurry ({laplacian_var:.0f})")
-
-        # Exposure check
-        mean_val = np.mean(gray)
-        if mean_val < EXPOSURE_MIN:
-            issues.append(f"underexposed ({mean_val:.0f})")
-        elif mean_val > EXPOSURE_MAX:
-            issues.append(f"overexposed ({mean_val:.0f})")
-
-        quality_ok = len(issues) == 0
-        return quality_ok, issues
-
-    def _preprocess_image(self, image: np.ndarray) -> np.ndarray:
-        """
-        Preprocess image for better COLMAP feature extraction.
-        Applies CLAHE contrast enhancement, denoising, and sharpening.
-        """
-        try:
-            # 1. Convert to LAB color space for CLAHE on luminance only
-            lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-            l_channel, a_channel, b_channel = cv2.split(lab)
-
-            # 2. CLAHE — Adaptive contrast enhancement
-            #    clipLimit=3.0: moderate contrast boost without over-amplifying noise
-            #    tileGridSize=(8,8): 8x8 tiles for local adaptation
-            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-            l_enhanced = clahe.apply(l_channel)
-
-            # 3. Merge back and convert to BGR
-            lab_enhanced = cv2.merge([l_enhanced, a_channel, b_channel])
-            enhanced = cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2BGR)
-
-            # 4. Bilateral filter — reduce noise while preserving edges
-            #    d=5: small neighborhood (fast), sigmaColor=50, sigmaSpace=50
-            denoised = cv2.bilateralFilter(enhanced, d=5, sigmaColor=50, sigmaSpace=50)
-
-            # 5. Unsharp mask — sharpen for better feature detection
-            #    Gaussian blur → subtract from original → add scaled difference
-            gaussian = cv2.GaussianBlur(denoised, (0, 0), sigmaX=2.0)
-            sharpened = cv2.addWeighted(denoised, 1.5, gaussian, -0.5, 0)
-
-            return sharpened
-
-        except Exception as e:
-            logger.warning(f"Image preprocessing failed: {e}. Using original.")
-            return image
-
-    def _parse_pose(self, pose_data: bytes) -> dict | None:
-        """Parse 6DoF pose from bytes (position + quaternion)."""
-        if len(pose_data) < 28:
-            return None
-
-        values = struct.unpack("<7f", pose_data[:28])
-        return {
-            "position": {"x": values[0], "y": values[1], "z": values[2]},
-            "rotation": {
-                "x": values[3], "y": values[4],
-                "z": values[5], "w": values[6],
-            },
-        }
-
-    def _unity_pose_to_colmap(self, pose: dict) -> tuple:
-        """
-        Convert Unity camera-to-world pose to COLMAP world-to-camera format.
-
-        Unity:  left-handed, Y-up, camera-to-world
-        COLMAP: right-handed, Y-down, world-to-camera
-
-        Returns: (qw, qx, qy, qz, tx, ty, tz) for COLMAP images.txt
-        """
+    @staticmethod
+    def _unity_pose_to_colmap(pose):
         pos = pose["position"]
         rot = pose["rotation"]
+        q = np.array([-rot["x"], rot["y"], -rot["z"], rot["w"]])
+        # First convert both Unity world/camera with Y reflection, then
+        # rotate the RH world 180 degrees around X so physical Y stays up.
+        upright = np.diag([1.0, -1.0, -1.0])
+        world_camera = upright @ Rotation.from_quat(q).as_matrix()
+        world_position = np.array([pos["x"], pos["y"], -pos["z"]])
+        camera_world = world_camera.T
+        q_camera_world = Rotation.from_matrix(camera_world).as_quat()
+        t = -camera_world @ world_position
+        return q_camera_world[3], *q_camera_world[:3], *t
 
-        # 1. Flip Y axis: Unity (Y-up) → COLMAP (Y-down)
-        #    Position: (x, -y, z)
-        px_c2w = pos["x"]
-        py_c2w = -pos["y"]
-        pz_c2w = pos["z"]
-
-        # 2. Quaternion for Y-flip: T*R*T where T=diag(1,-1,1)
-        #    Result: (qw, -qx, qy, -qz)
-        qw_c2w = rot["w"]
-        qx_c2w = -rot["x"]
-        qy_c2w = rot["y"]
-        qz_c2w = -rot["z"]
-
-        # 3. Invert: camera-to-world → world-to-camera
-        #    Quaternion inverse (conjugate for unit quat): (qw, -qx, -qy, -qz)
-        qw_w2c = qw_c2w
-        qx_w2c = -qx_c2w
-        qy_w2c = -qy_c2w
-        qz_w2c = -qz_c2w
-
-        # 4. Translation: t_w2c = -R_w2c @ t_c2w
-        R_w2c = Rotation.from_quat([qx_w2c, qy_w2c, qz_w2c, qw_w2c]).as_matrix()
-        t_c2w = np.array([px_c2w, py_c2w, pz_c2w])
-        t_w2c = -R_w2c @ t_c2w
-
-        return qw_w2c, qx_w2c, qy_w2c, qz_w2c, t_w2c[0], t_w2c[1], t_w2c[2]
-
-    def save_session_metadata(self):
-        """Save session metadata to JSON file."""
+    def save_session_metadata(self, status="captured"):
         elapsed = time.time() - self.start_time
         metadata = {
-            "session_id": self.session_id,
-            "total_frames": self.accepted_frames,
-            "rejected_frames": self.rejected_frames,
-            "duration_seconds": round(elapsed, 1),
-            "fps": round(self.accepted_frames / max(elapsed, 0.1), 1),
-            "timestamp": self.start_time,
-            "intrinsics": self.intrinsics,
+            "protocol_version": 2, "session_id": self.session_id,
+            "status": status, "total_frames": self.accepted_frames,
+            "received_frames": self.frame_count, "rejected_frames": self.rejected_frames,
+            "duration_seconds": round(elapsed, 2),
+            "timestamp": self.start_time, "camera_id": self.camera_id,
+            "intrinsics": self.intrinsics, "roi": self.roi,
             "frames": self.frame_metadata,
         }
-        meta_path = self.session_dir / "session_metadata.json"
-        with open(meta_path, "w") as f:
-            json.dump(metadata, f, indent=2)
-        logger.info(
-            f"Session metadata saved: {self.accepted_frames} frames, "
-            f"{elapsed:.1f}s, {self.rejected_frames} rejected"
-        )
+        atomic_write(self.session_dir / "session_metadata.json", json.dumps(metadata, indent=2).encode("utf-8"))
+        self.finalized = True
+        return metadata
 
     def prepare_colmap_input(self):
-        """Prepare COLMAP-compatible input structure."""
+        """Keep a reproducible original-JPEG input; never change captured pixels."""
         colmap_dir = self.session_dir / "colmap"
-        colmap_images = colmap_dir / "images"
-        colmap_dir.mkdir(parents=True, exist_ok=True)
-        colmap_images.mkdir(parents=True, exist_ok=True)
-
-        # Create symlinks or copies for COLMAP images
+        images_dir = colmap_dir / "images"
+        images_dir.mkdir(parents=True, exist_ok=True)
         for frame in self.frame_metadata:
             src = self.images_dir / frame["image"]
-            dst = colmap_images / frame["image"]
+            dst = images_dir / frame["image"]
             if src.exists() and not dst.exists():
-                try:
-                    dst.symlink_to(src.resolve())
-                except OSError:
-                    # Symlink not supported, copy instead
-                    import shutil
-                    shutil.copy2(str(src), str(dst))
-
-        # Write cameras.txt for known intrinsics
+                shutil.copy2(src, dst)
+        # Reference poses are not a COLMAP registration. Alignment must
+        # explicitly consume and verify them before claiming metric scale.
         if self.intrinsics:
-            cameras_path = colmap_dir / "cameras.txt"
-            fx = self.intrinsics["fx"]
-            fy = self.intrinsics["fy"]
-            cx = self.intrinsics["cx"]
-            cy = self.intrinsics["cy"]
-            w = self.intrinsics["width"]
-            h = self.intrinsics["height"]
-            with open(cameras_path, "w") as f:
-                f.write("# Camera list with one line of data per camera:\n")
-                f.write("#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
-                f.write(f"1 PINHOLE {w} {h} {fx} {fy} {cx} {cy}\n")
-
-        # Write images.txt with known poses (Unity → COLMAP coordinate conversion)
-        images_path = colmap_dir / "images.txt"
-        with open(images_path, "w") as f:
-            f.write("# Image list with two lines per image:\n")
-            f.write("#   IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n")
-            f.write("#   POINTS2D[] as (X, Y, POINT3D_ID)\n")
-            for i, frame in enumerate(self.frame_metadata):
-                pose = frame.get("pose")
-                if pose is None:
-                    continue
-                # Convert Unity (left-hand, camera-to-world) → COLMAP (right-hand, world-to-camera)
-                qw, qx, qy, qz, tx, ty, tz = self._unity_pose_to_colmap(pose)
-                f.write(
-                    f"{i + 1} {qw} {qx} {qy} {qz} {tx} {ty} {tz} 1 {frame['image']}\n"
-                )
-                f.write("\n")  # Empty line for points
-
-        # Write points3D.txt (empty)
-        points_path = colmap_dir / "points3D.txt"
-        with open(points_path, "w") as f:
-            f.write("# 3D point list (empty — to be filled by COLMAP)\n")
-
-        logger.info(f"COLMAP input prepared at: {colmap_dir}")
+            intr = self.intrinsics
+            camera_text = ("# CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n"
+                           f"1 PINHOLE {intr['width']} {intr['height']} "
+                           f"{intr['fx']} {intr['fy']} {intr['cx']} {intr['cy']}\n")
+            atomic_write(colmap_dir / "cameras.txt", camera_text.encode("utf-8"))
+        lines = ["# IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n"]
+        for i, frame in enumerate(self.frame_metadata, 1):
+            pose_values = self._unity_pose_to_colmap(frame["pose"])
+            lines.append(f"{i} {' '.join(map(str, pose_values))} 1 {frame['image']}\n\n")
+        atomic_write(colmap_dir / "images.txt", "".join(lines).encode("utf-8"))
+        atomic_write(colmap_dir / "points3D.txt", b"# Empty reference model\n")

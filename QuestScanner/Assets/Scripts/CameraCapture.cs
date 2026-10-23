@@ -1,11 +1,5 @@
-/*
- * MetaScan — Camera Capture
- * Captures passthrough camera images from Meta Quest 3S.
- * Uses MRUK PassthroughCameraAccess for direct Passthrough capture.
- * Falls back to WebCamTexture or RenderTexture.
- */
-
 using System;
+using System.Collections;
 using UnityEngine;
 
 #if META_XR_SDK
@@ -14,58 +8,48 @@ using Meta.XR;
 
 namespace MetaScan
 {
+    // Captures one physical PCA image, its timestamp and its camera pose as a unit.
     public class CameraCapture : MonoBehaviour
     {
-        [Header("Capture Settings")]
         [SerializeField] private int captureWidth = 1280;
         [SerializeField] private int captureHeight = 960;
-        [SerializeField] private int jpegQuality = 85;
-        [SerializeField] private float captureInterval = 0.1f; // 10 fps default
+        [SerializeField, Range(50, 100)] private int jpegQuality = 90;
+        [SerializeField] private float captureInterval = 0.25f;
+        [SerializeField] private float minimumTranslation = 0.02f;
+        [SerializeField] private float minimumRotationDegrees = 5f;
+        [SerializeField] private float maximumStepMetres = 0.4f;
+        [SerializeField] private float maximumStepDegrees = 60f;
 
-        // State
         public bool IsCapturing { get; private set; }
+        public bool IsReady { get; private set; }
         public int FrameIndex { get; private set; }
         public float LastCaptureTime { get; private set; }
-
-        // Events
+        public float FocalLengthX { get; private set; }
+        public float FocalLengthY { get; private set; }
+        public float PrincipalPointX { get; private set; }
+        public float PrincipalPointY { get; private set; }
         public event Action<CapturedFrame> OnFrameCaptured;
+        public event Action<string> OnCaptureError;
 
-        // Head tracking
-        private Transform headTransform;
         private float nextCaptureTime;
-
-        // Camera intrinsics (estimated defaults for Quest 3S passthrough)
-        // Horizontal FOV is ~110 degrees. fx = (1280/2) / tan(110/2) = 640 / 1.428 = 448
-        private float focalLengthX = 448f;
-        private float focalLengthY = 448f;
-        private float principalPointX = 640f;
-        private float principalPointY = 480f;
-
-        // Public accessors for intrinsics (ScanManager → PointCloudVisualizer deprojection)
-        public float FocalLengthX => focalLengthX;
-        public float FocalLengthY => focalLengthY;
-        public float PrincipalPointX => principalPointX;
-        public float PrincipalPointY => principalPointY;
-
-#if META_XR_SDK
-        // Official Meta Passthrough Camera Access API
-        private PassthroughCameraAccess mrukCameraAccess;
-#endif
-
-        // WebCamTexture fallback for real-world capture
-        private WebCamTexture webcamTexture;
-        private bool useWebCamCapture = false;
-
-        // Render texture for screenshot fallback
-        private RenderTexture captureRT;
+        private bool havePreviousPose;
+        private Vector3 previousPosition;
+        private Quaternion previousRotation;
+        private DateTime previousCameraTimestamp;
         private Texture2D captureTexture;
 
+#if META_XR_SDK
+        [SerializeField] private PassthroughCameraAccess cameraAccess;
+#endif
+
+        [Serializable]
         public struct CapturedFrame
         {
             public int frameIndex;
-            public double timestamp;
-            public byte[] imageData;       // JPEG
-            public byte[] depthData;       // raw uint16 (from DepthCapture)
+            public string cameraTimestamp;
+            public byte[] imageData;
+            public int imageWidth, imageHeight;
+            public string cameraId;
             public Vector3 position;
             public Quaternion rotation;
             public float fx, fy, cx, cy;
@@ -73,272 +57,194 @@ namespace MetaScan
 
         private void Start()
         {
-            FindHeadTransform();
-
-            // Create capture texture for fallback
-            captureRT = new RenderTexture(captureWidth, captureHeight, 24);
-            captureTexture = new Texture2D(captureWidth, captureHeight, TextureFormat.RGB24, false);
-
-            StartCoroutine(InitializeCameraRoutine());
+            StartCoroutine(InitializeCamera());
         }
 
-        private System.Collections.IEnumerator InitializeCameraRoutine()
+        private IEnumerator InitializeCamera()
         {
-#if UNITY_ANDROID && !UNITY_EDITOR
-            string camPermission = UnityEngine.Android.Permission.Camera;
-            
-            // Request permissions if not already granted
-            if (!UnityEngine.Android.Permission.HasUserAuthorizedPermission(camPermission))
+#if UNITY_ANDROID && !UNITY_EDITOR && META_XR_SDK
+            const string cameraPermission = "horizonos.permission.HEADSET_CAMERA";
+            if (!UnityEngine.Android.Permission.HasUserAuthorizedPermission(cameraPermission))
             {
-                UnityEngine.Android.Permission.RequestUserPermission(camPermission);
-                
-                // Wait until the user either grants or denies the permission
-                float timeout = Time.time + 30f; // 30 seconds timeout
-                while (!UnityEngine.Android.Permission.HasUserAuthorizedPermission(camPermission))
-                {
-                    if (Time.time > timeout)
-                    {
-                        Debug.LogWarning("[MetaScan-Camera] Permission request timed out.");
-                        yield break;
-                    }
+                UnityEngine.Android.Permission.RequestUserPermission(cameraPermission);
+                float deadline = Time.realtimeSinceStartup + 30f;
+                while (!UnityEngine.Android.Permission.HasUserAuthorizedPermission(cameraPermission)
+                       && Time.realtimeSinceStartup < deadline)
                     yield return null;
+                if (!UnityEngine.Android.Permission.HasUserAuthorizedPermission(cameraPermission))
+                {
+                    ReportError("Headset camera permission denied or timed out.");
+                    yield break;
                 }
             }
-
-            // Wait a little bit extra to ensure OS is ready
-            yield return new WaitForSeconds(0.5f);
-
-#if META_XR_SDK
-            // Try to initialize MRUK PassthroughCameraAccess
-            mrukCameraAccess = FindFirstObjectByType<PassthroughCameraAccess>();
-            if (mrukCameraAccess == null)
+            if (cameraAccess == null)
+                cameraAccess = FindFirstObjectByType<PassthroughCameraAccess>();
+            if (cameraAccess == null)
             {
-                Debug.Log("[MetaScan-Camera] PassthroughCameraAccess not found in scene. Creating one...");
-                mrukCameraAccess = gameObject.AddComponent<PassthroughCameraAccess>();
-                yield return new WaitForSeconds(0.5f); // Wait for initialization
+                // Configure source before enabling the component.
+                var source = new GameObject("MetaScanPhysicalCamera");
+                source.SetActive(false);
+                cameraAccess = source.AddComponent<PassthroughCameraAccess>();
+                cameraAccess.CameraPosition = PassthroughCameraAccess.CameraPositionType.Left;
+                cameraAccess.RequestedResolution = new Vector2Int(captureWidth, captureHeight);
+                source.SetActive(true);
             }
-
-            if (mrukCameraAccess != null)
+            if (!PassthroughCameraAccess.IsSupported)
             {
-                Debug.Log("[MetaScan-Camera] Official MRUK PassthroughCameraAccess enabled.");
+                ReportError("Passthrough Camera Access is unsupported on this device.");
+                yield break;
             }
-#endif
-
-            // Fallback: WebCamTexture
-            if (WebCamTexture.devices.Length > 0)
-            {
-                webcamTexture = new WebCamTexture(WebCamTexture.devices[0].name, captureWidth, captureHeight, 30);
-                
-                // Force WebCamTexture to update by applying it to a dummy renderer
-                GameObject dummyObj = GameObject.CreatePrimitive(PrimitiveType.Quad);
-                dummyObj.name = "WebCamDummyRenderer";
-                dummyObj.transform.SetParent(this.transform);
-                // Hide it behind the camera or make it very small/disabled visual but active object
-                dummyObj.transform.localPosition = new Vector3(0, -1000, 0); 
-                dummyObj.transform.localScale = Vector3.zero;
-                MeshRenderer renderer = dummyObj.GetComponent<MeshRenderer>();
-                renderer.material.mainTexture = webcamTexture;
-
-                webcamTexture.Play();
-                useWebCamCapture = true;
-                Debug.Log("[MetaScan-Camera] WebCamTexture fallback initialized on: " + WebCamTexture.devices[0].name);
-            }
-            else
-            {
-                Debug.LogWarning("[MetaScan-Camera] No WebCam devices found.");
-            }
+            float readyDeadline = Time.realtimeSinceStartup + 30f;
+            while (!cameraAccess.IsPlaying && Time.realtimeSinceStartup < readyDeadline)
+                yield return null;
+            IsReady = cameraAccess.IsPlaying && cameraAccess.GetTexture() != null;
+            if (!IsReady)
+                ReportError("Physical passthrough camera did not become ready.");
 #else
-            yield return null;
+            ReportError("Physical passthrough capture requires a Quest Android build with Meta XR SDK.");
+            yield break;
 #endif
         }
 
-        private void FindHeadTransform()
+        public bool StartCapturing()
         {
-#if META_XR_SDK
-            OVRCameraRig rig = FindFirstObjectByType<OVRCameraRig>();
-            if (rig != null && rig.centerEyeAnchor != null)
+            if (!IsReady)
             {
-                headTransform = rig.centerEyeAnchor;
-                return;
+                ReportError("Physical camera is not ready.");
+                return false;
             }
-#endif
-            Camera cam = Camera.main;
-            if (cam != null) headTransform = cam.transform;
-
-#if META_XR_SDK
-            // Instead of hallucinated OVRPlugin.GetIntrinsics, read directly from the Unity Camera
-            // which OVRManager already updates with the real hardware intrinsics per frame!
-            Camera centerCam = headTransform != null ? headTransform.GetComponent<Camera>() : Camera.main;
-            if (centerCam != null) {
-                // The projection matrix P[0,0] is (2 * near) / (right - left)
-                // In terms of focal length: P[0,0] = fx_normalized = 2 * fx / width
-                // So fx = P[0,0] * width / 2
-                float fx = centerCam.projectionMatrix[0, 0] * (captureWidth / 2f);
-                float fy = centerCam.projectionMatrix[1, 1] * (captureHeight / 2f);
-                
-                if (fx > 0 && fy > 0) {
-                    focalLengthX = fx;
-                    focalLengthY = fy;
-                    principalPointX = captureWidth / 2f;
-                    principalPointY = captureHeight / 2f;
-                    Debug.Log($"[MetaScan-Camera] Real Intrinsics from Camera Matrix: fx={focalLengthX}, fy={focalLengthY}");
-                }
-            }
-#endif
-        }
-
-        public void StartCapturing()
-        {
             IsCapturing = true;
             FrameIndex = 0;
+            havePreviousPose = false;
+            previousCameraTimestamp = default;
             nextCaptureTime = 0f;
-
-            if (useWebCamCapture && webcamTexture != null && !webcamTexture.isPlaying)
-            {
-                webcamTexture.Play();
-            }
-
-            Debug.Log("[MetaScan-Camera] Capture started.");
+            return true;
         }
 
-        public void StopCapturing()
-        {
-            IsCapturing = false;
-            if (useWebCamCapture && webcamTexture != null)
-            {
-                webcamTexture.Stop();
-            }
-            Debug.Log($"[MetaScan-Camera] Capture stopped. Total frames: {FrameIndex}");
-        }
+        public void StopCapturing() => IsCapturing = false;
 
         private void Update()
         {
-            if (!IsCapturing) return;
-            if (Time.time < nextCaptureTime) return;
-
-            CaptureFrame();
-            nextCaptureTime = Time.time + captureInterval;
-        }
-
-        private void CaptureFrame()
-        {
-            if (headTransform == null)
-            {
-                FindHeadTransform();
-                if (headTransform == null) return;
-            }
-
-            byte[] imageData = CaptureImage();
-            if (imageData == null || imageData.Length == 0) return;
-
-            CapturedFrame frame = new CapturedFrame
-            {
-                frameIndex = FrameIndex,
-                timestamp = GetTimestamp(),
-                imageData = imageData,
-                depthData = new byte[0], // Will be filled by DataStreamer from DepthCapture
-                position = headTransform.position,
-                rotation = headTransform.rotation,
-                fx = focalLengthX,
-                fy = focalLengthY,
-                cx = principalPointX,
-                cy = principalPointY,
-            };
-
-            FrameIndex++;
-            LastCaptureTime = Time.time;
-
-            OnFrameCaptured?.Invoke(frame);
-        }
-
-        private byte[] CaptureImage()
-        {
+            if (!IsCapturing || Time.unscaledTime < nextCaptureTime)
+                return;
 #if META_XR_SDK
-            // 1. Try Official MRUK Passthrough Camera Access API (Meta Quest 3/3S V74+)
-            if (mrukCameraAccess != null)
-            {
-                Texture ptTexture = mrukCameraAccess.GetTexture();
-                if (ptTexture != null && ptTexture.width > 16)
-                {
-                    // Copy to avoid modifying the original buffer directly and support encoding
-                    Texture2D texCopy = new Texture2D(ptTexture.width, ptTexture.height, TextureFormat.RGB24, false);
-                    
-                    // Safely convert any Texture to Texture2D using a temporary RenderTexture
-                    RenderTexture prevRT2 = RenderTexture.active;
-                    RenderTexture tempRT = RenderTexture.GetTemporary(ptTexture.width, ptTexture.height, 0, RenderTextureFormat.Default, RenderTextureReadWrite.Default);
-                    Graphics.Blit(ptTexture, tempRT);
-                    RenderTexture.active = tempRT;
-                    texCopy.ReadPixels(new Rect(0, 0, tempRT.width, tempRT.height), 0, 0);
-                    texCopy.Apply();
-                    RenderTexture.active = prevRT2;
-                    RenderTexture.ReleaseTemporary(tempRT);
+            if (cameraAccess == null || !cameraAccess.IsPlaying || !cameraAccess.IsUpdatedThisFrame)
+                return;
 
-                    byte[] data = texCopy.EncodeToJPG(jpegQuality);
-                    Destroy(texCopy);
-                    return data;
-                }
+            DateTime timestamp = cameraAccess.Timestamp;
+            if (timestamp == previousCameraTimestamp)
+                return;
+            Pose pose = cameraAccess.GetCameraPose();
+            if (havePreviousPose &&
+                (Vector3.Distance(previousPosition, pose.position) > maximumStepMetres ||
+                 Quaternion.Angle(previousRotation, pose.rotation) > maximumStepDegrees))
+            {
+                StopCapturing();
+                ReportError("Physical camera pose jumped; tracking may have reset. Start a new scan.");
+                return;
             }
+            if (havePreviousPose
+                && Vector3.Distance(previousPosition, pose.position) < minimumTranslation
+                && Quaternion.Angle(previousRotation, pose.rotation) < minimumRotationDegrees)
+                return;
+            var resolution = cameraAccess.CurrentResolution;
+            if (resolution.x < 16 || resolution.y < 16)
+                return;
+
+            // The SDK viewport uses a bottom-left origin; JPEG/OpenCV use top-left.
+            // Derive the effective pinhole intrinsics from SDK rays in camera space.
+            if (!TryGetTopLeftIntrinsics(pose, resolution, out float fx, out float fy, out float cx, out float cy))
+            {
+                ReportError("PCA calibration could not be resolved.");
+                StopCapturing();
+                return;
+            }
+
+            // GetColors is the documented current-image CPU API. GetTexture +
+            // Graphics.Blit can return the previous frame on the render thread.
+            var pixels = cameraAccess.GetColors();
+            if (pixels.Length != resolution.x * resolution.y)
+            {
+                StopCapturing();
+                ReportError($"PCA pixel count mismatch: {pixels.Length} for {resolution.x}x{resolution.y}.");
+                return;
+            }
+            if (cameraAccess.Timestamp != timestamp)
+                return;
+            if (captureTexture == null || captureTexture.width != resolution.x || captureTexture.height != resolution.y)
+            {
+                if (captureTexture != null) Destroy(captureTexture);
+                captureTexture = new Texture2D(resolution.x, resolution.y, TextureFormat.RGBA32, false);
+            }
+            captureTexture.SetPixelData(pixels, 0);
+            captureTexture.Apply(false, false);
+            byte[] image = captureTexture.EncodeToJPG(jpegQuality);
+            if (cameraAccess.Timestamp != timestamp || image == null || image.Length == 0)
+                return;
+
+            FocalLengthX = fx;
+            FocalLengthY = fy;
+            PrincipalPointX = cx;
+            PrincipalPointY = cy;
+            var frame = new CapturedFrame
+            {
+                frameIndex = FrameIndex++,
+                cameraTimestamp = timestamp.ToString("O"),
+                imageData = image,
+                imageWidth = resolution.x,
+                imageHeight = resolution.y,
+                cameraId = cameraAccess.CameraPosition == PassthroughCameraAccess.CameraPositionType.Left ? "left" : "right",
+                position = pose.position,
+                rotation = pose.rotation,
+                fx = fx, fy = fy, cx = cx, cy = cy
+            };
+            previousCameraTimestamp = timestamp;
+            previousPosition = pose.position;
+            previousRotation = pose.rotation;
+            havePreviousPose = true;
+            LastCaptureTime = Time.unscaledTime;
+            nextCaptureTime = LastCaptureTime + captureInterval;
+            OnFrameCaptured?.Invoke(frame);
+#endif
+        }
+
+#if META_XR_SDK
+        private bool TryGetTopLeftIntrinsics(Pose pose, Vector2Int size,
+            out float fx, out float fy, out float cx, out float cy)
+        {
+            fx = fy = cx = cy = 0f;
+            Vector3 left = Quaternion.Inverse(pose.rotation) *
+                cameraAccess.ViewportPointToRay(new Vector2(0f, 0.5f), pose).direction;
+            Vector3 right = Quaternion.Inverse(pose.rotation) *
+                cameraAccess.ViewportPointToRay(new Vector2(1f, 0.5f), pose).direction;
+            Vector3 bottom = Quaternion.Inverse(pose.rotation) *
+                cameraAccess.ViewportPointToRay(new Vector2(0.5f, 0f), pose).direction;
+            Vector3 top = Quaternion.Inverse(pose.rotation) *
+                cameraAccess.ViewportPointToRay(new Vector2(0.5f, 1f), pose).direction;
+            if (left.z <= 0 || right.z <= 0 || bottom.z <= 0 || top.z <= 0)
+                return false;
+            float lx = left.x / left.z, rx = right.x / right.z;
+            float by = bottom.y / bottom.z, ty = top.y / top.z;
+            if (rx - lx < 0.01f || ty - by < 0.01f)
+                return false;
+            fx = size.x / (rx - lx);
+            fy = size.y / (ty - by);
+            cx = -fx * lx;
+            cy = fy * ty;
+            return fx > 0 && fy > 0 && cx >= 0 && cy >= 0 && cx <= size.x && cy <= size.y;
+        }
 #endif
 
-            // 2. Try WebCamTexture API (Fallback for standard Android or earlier SDK)
-            if (useWebCamCapture && webcamTexture != null && webcamTexture.isPlaying && webcamTexture.width > 16)
-            {
-                Texture2D tempTex = new Texture2D(webcamTexture.width, webcamTexture.height, TextureFormat.RGB24, false);
-                tempTex.SetPixels(webcamTexture.GetPixels());
-                tempTex.Apply();
-                byte[] jpegData = tempTex.EncodeToJPG(jpegQuality);
-                Destroy(tempTex);
-                return jpegData;
-            }
+        public void SetCaptureRate(float fps) => captureInterval = 1f / Mathf.Max(fps, 1f);
 
-            // 3. Fallback: capture screen via RenderTexture (Unity UI + Camera Render - NO REAL WORLD)
-            Camera cam = headTransform != null
-                ? headTransform.GetComponent<Camera>()
-                : Camera.main;
-
-            if (cam == null) return null;
-
-            RenderTexture prevRT = cam.targetTexture;
-            cam.targetTexture = captureRT;
-            cam.Render();
-            cam.targetTexture = prevRT;
-
-            RenderTexture prevActive = RenderTexture.active;
-            RenderTexture.active = captureRT;
-            captureTexture.ReadPixels(new Rect(0, 0, captureWidth, captureHeight), 0, 0);
-            captureTexture.Apply();
-            RenderTexture.active = prevActive;
-
-            return captureTexture.EncodeToJPG(jpegQuality);
-        }
-
-        private double GetTimestamp()
+        private void ReportError(string message)
         {
-            return (DateTime.UtcNow - new DateTime(1970, 1, 1)).TotalSeconds;
-        }
-
-        /// <summary>
-        /// Set camera intrinsics from external source (e.g., OVR API).
-        /// </summary>
-        public void SetIntrinsics(float fx, float fy, float cx, float cy)
-        {
-            focalLengthX = fx;
-            focalLengthY = fy;
-            principalPointX = cx;
-            principalPointY = cy;
-        }
-
-        /// <summary>
-        /// Set capture frame rate.
-        /// </summary>
-        public void SetCaptureRate(float fps)
-        {
-            captureInterval = 1f / Mathf.Max(fps, 1f);
+            Debug.LogError("[MetaScan-Camera] " + message);
+            OnCaptureError?.Invoke(message);
         }
 
         private void OnDestroy()
         {
-            if (captureRT != null) captureRT.Release();
             if (captureTexture != null) Destroy(captureTexture);
         }
     }

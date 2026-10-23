@@ -309,8 +309,8 @@
                 </select>
             </div>
             <div class="ctrl" style="margin-top:10px;">
-                <label>Çıktı Klasörü (Opsiyonel)</label>
-                <input type="text" id="reconOutputDir" class="btn btn-sm btn-full" placeholder="C:\Custom\Output\Dir" style="background:var(--bg-card); color:var(--text); text-align:left; border:1px solid var(--border); padding-left:10px;">
+                <label>Çıktı Alt Klasörü (Opsiyonel)</label>
+                <input type="text" id="reconOutputDir" class="btn btn-sm btn-full" placeholder="deneme-1" style="background:var(--bg-card); color:var(--text); text-align:left; border:1px solid var(--border); padding-left:10px;">
             </div>
             
             <div id="reconProgressContainer" style="display:none; margin-top:12px;">
@@ -424,6 +424,10 @@
         scene.add(gridHelper);
 
         let currentModel = null;
+        let currentUnits = 'm';
+        let currentUpAxis = 'y';
+        let currentCenter = new THREE.Vector3();
+        let currentMaxDim = 1;
         let currentRenderMode = 'solid';
         const API = window.location.origin;
 
@@ -459,22 +463,16 @@
             currentModel = null;
         }
 
-        function addModel(obj, fmt) {
+        function addModel(obj, fmt, units = 'm') {
             clearModel();
-
             const box = new THREE.Box3().setFromObject(obj);
             const center = box.getCenter(new THREE.Vector3());
             const size = box.getSize(new THREE.Vector3());
             const maxDim = Math.max(size.x, size.y, size.z, 0.001);
-
-            obj.traverse(c => {
-                if (c.geometry) {
-                    c.geometry.translate(-center.x, -center.y, -center.z);
-                }
-            });
-
-            obj.position.set(0, 0, 0);
-            obj.scale.setScalar(2 / maxDim);
+            currentUnits = units;
+            currentUpAxis = fmt.toLowerCase() === 'stl' ? 'z' : 'y';
+            currentCenter.copy(center);
+            currentMaxDim = maxDim;
 
             obj.traverse(c => {
                 if (c.isMesh) {
@@ -491,11 +489,15 @@
             scene.add(obj);
             currentModel = obj;
 
-            camera.position.set(2, 1.5, 2);
-            controls.target.set(0, 0, 0);
+            camera.near = Math.max(maxDim / 1000, 0.00001);
+            camera.far = Math.max(maxDim * 1000, 10);
+            camera.updateProjectionMatrix();
+            camera.position.copy(center).add(new THREE.Vector3(1.4, 1.0, 1.4).multiplyScalar(maxDim));
+            controls.target.copy(center);
+            controls.minDistance = maxDim * 0.05;
+            controls.maxDistance = maxDim * 100;
             controls.update();
 
-            // Stats
             // Stats
             let verts = 0, faces = 0;
             obj.traverse(c => {
@@ -510,7 +512,7 @@
 
             document.getElementById('sVert').textContent = fmtNum(verts);
             document.getElementById('sFace').textContent = fmtNum(Math.floor(faces));
-            document.getElementById('sSize').textContent = (maxDim * 100).toFixed(1);
+            document.getElementById('sSize').textContent = (maxDim * (units === 'mm' ? 0.1 : 100)).toFixed(1);
             document.getElementById('sFmt').textContent = fmt.toUpperCase();
 
             document.getElementById('emptyState').style.display = 'none';
@@ -520,17 +522,17 @@
             toast(`✅ Model yüklendi: ${fmtNum(verts)} vertex`, 'success');
         }
 
-        function loadFromURL(url, fmt) {
+        function loadFromURL(url, fmt, units = 'm') {
             showLoading('Model yükleniyor...');
             const onErr = (e) => { hideLoading(); toast('❌ Yükleme hatası: ' + e.message, 'error'); };
             const onProg = () => {};
 
             switch (fmt) {
                 case 'obj':
-                    new THREE.OBJLoader().load(url, o => addModel(o, 'OBJ'), onProg, onErr);
+                    new THREE.OBJLoader().load(url, o => addModel(o, 'OBJ', units), onProg, onErr);
                     break;
                 case 'glb': case 'gltf':
-                    new THREE.GLTFLoader().load(url, g => addModel(g.scene, 'GLB'), onProg, onErr);
+                    new THREE.GLTFLoader().load(url, g => addModel(g.scene, 'GLB', units), onProg, onErr);
                     break;
                 case 'ply':
                     new THREE.PLYLoader().load(url, geo => {
@@ -550,7 +552,7 @@
                             });
                             obj = new THREE.Points(geo, mat);
                         }
-                        addModel(obj, 'PLY');
+                        addModel(obj, 'PLY', units);
                     }, onProg, onErr);
                     break;
                 case 'stl':
@@ -559,7 +561,7 @@
                         const mat = new THREE.MeshStandardMaterial({
                             color: 0x8888cc, roughness: 0.5, metalness: 0.1,
                         });
-                        addModel(new THREE.Mesh(geo, mat), 'STL');
+                        addModel(new THREE.Mesh(geo, mat), 'STL', units);
                     }, onProg, onErr);
                     break;
             }
@@ -571,7 +573,7 @@
 
             const ext = file.name.split('.').pop().toLowerCase();
             const url = URL.createObjectURL(file);
-            loadFromURL(url, ext);
+            loadFromURL(url, ext, ext === 'stl' ? 'mm' : 'm');
         }
 
         // =================================================================
@@ -635,8 +637,9 @@
         }
 
         function resetCamera() {
-            camera.position.set(2, 1.5, 2);
-            controls.target.set(0, 0, 0);
+            camera.position.copy(currentCenter).add(
+                new THREE.Vector3(1.4, 1.0, 1.4).multiplyScalar(currentMaxDim));
+            controls.target.copy(currentCenter);
             controls.update();
         }
 
@@ -665,14 +668,23 @@
 
             if (format === 'stl') {
                 const exporter = new THREE.STLExporter();
-                data = exporter.parse(currentModel, { binary: true });
-                filename = 'metascan_model.stl';
+                const modelForPrint = new THREE.Group();
+                modelForPrint.add(currentModel.clone(true));
+                if (currentUpAxis === 'y') modelForPrint.rotation.x = Math.PI / 2;
+                if (currentUnits === 'm') modelForPrint.scale.setScalar(1000);
+                modelForPrint.updateMatrixWorld(true);
+                const bounds = new THREE.Box3().setFromObject(modelForPrint);
+                const center = bounds.getCenter(new THREE.Vector3());
+                modelForPrint.position.set(-center.x, -center.y, -bounds.min.z);
+                modelForPrint.updateMatrixWorld(true);
+                data = exporter.parse(modelForPrint, { binary: true });
+                filename = 'metascan_model_mm.stl';
                 mimeType = 'application/octet-stream';
                 downloadBlob(new Blob([data], { type: mimeType }), filename);
             } else if (format === 'obj') {
                 const exporter = new THREE.OBJExporter();
                 data = exporter.parse(currentModel);
-                filename = 'metascan_model.obj';
+                filename = 'metascan_model_' + currentUnits + '.obj';
                 mimeType = 'text/plain';
                 downloadBlob(new Blob([data], { type: mimeType }), filename);
             }
@@ -746,9 +758,9 @@
 
                 if (data.exports && data.exports.length > 0) {
                     // Load first available model
-                    const model = data.exports[0];
+                    const model = data.exports.find(e => e.role === 'editable_glb_metres') || data.exports[0];
                     const ext = model.filename.split('.').pop().toLowerCase();
-                    loadFromURL(API + model.url, ext);
+                    loadFromURL(API + model.url, ext, model.role?.includes('millimetres') ? 'mm' : 'm');
 
                     // Show download links for all exports
                     const sec = document.getElementById('exportSection');
@@ -761,7 +773,7 @@
                     btns.innerHTML = data.exports.map(e => {
                         const ext = e.filename.split('.').pop().toLowerCase();
                         return `<div style="display:flex;gap:4px;width:100%;">
-                            <button class="btn btn-sm btn-primary" style="flex:1; justify-content:flex-start;" onclick="loadFromURL('${API}${e.url}', '${ext}')">👁️ ${e.format}</button>
+                            <button class="btn btn-sm btn-primary" style="flex:1; justify-content:flex-start;" onclick="loadFromURL('${API}${e.url}', '${ext}', '${e.role?.includes('millimetres') ? 'mm' : 'm'}')">👁️ ${e.role || e.format}</button>
                             <a class="btn btn-sm" style="width:36px; padding:0; display:flex; align-items:center; justify-content:center;" href="${API}${e.url}" download title="İndir">📥</a>
                         </div>`;
                     }).join('');
@@ -785,13 +797,17 @@
             let outputDir = document.getElementById('reconOutputDir').value || '';
             
             // Build url with query params
-            let url = `${API}/api/sessions/${activeSessionId}/reconstruct?method=full&quality=${quality}`;
+            let url = `${API}/api/sessions/${activeSessionId}/reconstruct?method=colmap&quality=${quality}`;
             if (outputDir.trim() !== '') {
                 url += `&output_dir=${encodeURIComponent(outputDir)}`;
             }
 
             try {
-                await fetch(url, { method: 'POST' });
+                const response = await fetch(url, { method: 'POST' });
+                if (!response.ok) {
+                    const failure = await response.json().catch(() => ({}));
+                    throw new Error(failure.detail || `HTTP ${response.status}`);
+                }
                 toast('🔧 Reconstruction başlatıldı...', 'info');
                 
                 document.getElementById('reconBtnGroup').style.display = 'none';
@@ -802,7 +818,7 @@
 
                 pollReconstruction(activeSessionId);
             } catch (e) {
-                toast('❌ Reconstruction başlatılamadı', 'error');
+                toast('❌ Reconstruction başlatılamadı: ' + e.message, 'error');
             }
         }
 

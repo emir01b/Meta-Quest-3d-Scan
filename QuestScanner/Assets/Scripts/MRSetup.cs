@@ -20,17 +20,9 @@ namespace MetaScan
 
         private void ConfigurePassthrough()
         {
-#if UNITY_ANDROID && !UNITY_EDITOR
-            // Request Scene permission explicitly at startup for Depth sensor
-            if (!UnityEngine.Android.Permission.HasUserAuthorizedPermission("com.oculus.permission.USE_SCENE"))
-            {
-                UnityEngine.Android.Permission.RequestUserPermission("com.oculus.permission.USE_SCENE");
-            }
-#endif
-
 #if META_XR_SDK
             // Configure OVRManager for passthrough
-            OVRManager ovrManager = FindFirstObjectByType<OVRManager>();
+            OVRManager ovrManager = FindAnyObjectByType<OVRManager>();
             if (ovrManager == null)
             {
                 Debug.LogError("[MetaScan-MR] OVRManager not found! Add OVRCameraRig to scene.");
@@ -38,13 +30,6 @@ namespace MetaScan
             }
 
             ovrManager.isInsightPassthroughEnabled = enablePassthrough;
-
-            // Enable camera access if supported by SDK version
-#if META_XR_SDK
-            // Note: In newer SDKs this might be property of OVRManager or OVRProjectConfig
-            // We set it in Project Config, but some SDK versions allow runtime toggle
-            // ovrManager.isPassthroughCameraAccessEnabled = true; 
-#endif
 
             // Add passthrough layer (SDK handles layering automatically)
             OVRPassthroughLayer passthroughLayer = ovrManager.GetComponent<OVRPassthroughLayer>();
@@ -54,7 +39,7 @@ namespace MetaScan
             }
 
             // Configure camera for passthrough (transparent background)
-            OVRCameraRig cameraRig = FindFirstObjectByType<OVRCameraRig>();
+            OVRCameraRig cameraRig = FindAnyObjectByType<OVRCameraRig>();
             if (cameraRig != null && cameraRig.centerEyeAnchor != null)
             {
                 Camera centerCamera = cameraRig.centerEyeAnchor.GetComponent<Camera>();
@@ -68,12 +53,6 @@ namespace MetaScan
             // Set tracking origin to FloorLevel for better walking experience
             OVRManager.TrackingOrigin trackingOrigin = OVRManager.TrackingOrigin.FloorLevel;
             ovrManager.trackingOriginType = trackingOrigin;
-
-            // Disable boundary visibility to prevent the stationary circle from restricting movement
-            if (OVRManager.boundary != null)
-            {
-                OVRManager.boundary.SetVisible(false);
-            }
 
             Debug.Log("[MetaScan-MR] Passthrough configured: enabled=" + enablePassthrough);
 #else

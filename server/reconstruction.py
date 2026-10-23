@@ -1,736 +1,450 @@
+"""Metric object reconstruction from immutable Quest RGB captures.
+
+COLMAP reconstructs image geometry, then aligns it to the physical camera
+centres recorded by PCA. No export is labelled metric if alignment fails.
 """
-MetaScan — 3D Reconstruction Pipeline
-COLMAP SfM + Open3D mesh reconstruction.
-Exports to OBJ, STL, GLB, PLY formats.
-"""
+
+import hashlib
 import json
 import logging
+import math
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import cv2
 import numpy as np
+import trimesh
 from scipy.spatial.transform import Rotation
 
+from config import (
+    COLMAP_BINARY, EXPORTS_DIR, MIN_FRAMES_FOR_RECONSTRUCTION,
+    MAX_FRAMES_FOR_RECONSTRUCTION,
+)
+from frame_handler import atomic_write
+
 logger = logging.getLogger("metascan.reconstruction")
+PIPELINE_VERSION = "metric-rgb-v2"
+STAGES = ("features", "matching", "mapper", "aligned", "alignment_text",
+          "undistort", "stereo", "fusion", "meshing")
+
+
+class ReconstructionError(RuntimeError):
+    pass
+
+
+def make_match_pairs(frames: list[dict], neighbors: int = 12, loops: int = 5) -> list[tuple[str, str]]:
+    """Temporal overlap plus spatial loop closures from physical camera centres."""
+    pairs = set()
+    positions = np.array([
+        [frame["pose"]["position"][axis] for axis in ("x", "y", "z")]
+        for frame in frames
+    ], dtype=float)
+    for i, frame in enumerate(frames):
+        for j in range(i + 1, min(len(frames), i + neighbors + 1)):
+            pairs.add(tuple(sorted((frame["image"], frames[j]["image"]))))
+        if loops and len(frames) > neighbors * 2:
+            distances = np.linalg.norm(positions - positions[i], axis=1)
+            candidates = [
+                j for j in np.argsort(distances)
+                if abs(j - i) > neighbors and 0.02 <= distances[j] <= 0.20
+            ]
+            for j in candidates[:loops]:
+                pairs.add(tuple(sorted((frame["image"], frames[j]["image"]))))
+    return sorted(pairs)
+
+
+def _safe_reset(path: Path, root: Path):
+    resolved, allowed = path.resolve(), root.resolve()
+    if resolved == allowed or allowed not in resolved.parents or path.is_symlink():
+        raise ReconstructionError("unsafe generated path")
+    if path.exists():
+        shutil.rmtree(path)
+    path.mkdir(parents=True)
+
+
+def make_roi_masks(metadata: dict, mask_dir: Path):
+    """Project the selected Unity-world sphere into each physical camera image.
+
+    These masks constrain dense fusion, leaving background features available
+    for SfM. The mask is deliberately conservative at the sphere boundary.
+    """
+    roi = metadata.get("roi")
+    if not roi:
+        return None
+    mask_dir.mkdir(parents=True, exist_ok=True)
+    center = np.array([roi["center"][k] for k in ("x", "y", "z")], dtype=float)
+    radius = float(roi["radius"]) * 1.15
+    intr = metadata["intrinsics"]
+    width, height = int(intr["width"]), int(intr["height"])
+    for frame in metadata["frames"]:
+        pose = frame["pose"]
+        location = np.array([pose["position"][k] for k in ("x", "y", "z")], dtype=float)
+        quaternion = [pose["rotation"][k] for k in ("x", "y", "z", "w")]
+        local = Rotation.from_quat(quaternion).inv().apply(center - location)
+        mask = np.zeros((height, width), dtype=np.uint8)
+        if local[2] <= 0:
+            pass  # Object is behind the physical camera.
+        elif local[2] <= radius:
+            # Degenerate camera-inside-ROI case: do not silently discard all
+            # potentially useful pixels.
+            mask[:] = 255
+        else:
+            u = intr["fx"] * local[0] / local[2] + intr["cx"]
+            v = intr["cy"] - intr["fy"] * local[1] / local[2]
+            denominator = local[2] - radius
+            rx = min(width * 2, int(math.ceil(intr["fx"] * radius / denominator)))
+            ry = min(height * 2, int(math.ceil(intr["fy"] * radius / denominator)))
+            cv2.ellipse(mask, (int(round(u)), int(round(v))),
+                        (max(1, rx), max(1, ry)), 0, 0, 360, 255, -1)
+        destination = mask_dir / (frame["image"] + ".png")
+        if not cv2.imwrite(str(destination), mask):
+            raise ReconstructionError(f"Failed to write ROI mask: {destination}")
+    return mask_dir
+
+
+def evaluate_metric_alignment(images_txt: Path, frames: list[dict]) -> dict:
+    """Check all registered COLMAP centres against independent Quest poses."""
+    reference = {
+        frame["image"]: np.array([frame["pose"]["position"][axis] * sign
+                                  for axis, sign in (("x", 1), ("y", 1), ("z", -1))], dtype=float)
+        for frame in frames
+    }
+    errors = []
+    for line in images_txt.read_text(encoding="utf-8").splitlines():
+        fields = line.split()
+        if len(fields) < 10 or not fields[0].isdigit() or fields[9] not in reference:
+            continue
+        q = np.array([float(v) for v in fields[1:5]])
+        t = np.array([float(v) for v in fields[5:8]])
+        if not np.isfinite(q).all() or not np.isfinite(t).all():
+            raise ReconstructionError("Non-finite aligned camera pose")
+        rotation = Rotation.from_quat([q[1], q[2], q[3], q[0]])
+        centre = -rotation.inv().apply(t)
+        errors.append(float(np.linalg.norm(centre - reference[fields[9]])))
+    required = max(20, math.ceil(len(frames) * 0.5))
+    if len(errors) < required:
+        raise ReconstructionError(f"Only {len(errors)}/{len(frames)} images registered; need {required}")
+    result = {
+        "registered_images": len(errors), "input_images": len(frames),
+        "registered_fraction": len(errors) / len(frames),
+        "median_camera_error_m": float(np.median(errors)),
+        "p90_camera_error_m": float(np.percentile(errors, 90)),
+        "within_5cm_fraction": float(np.mean(np.asarray(errors) <= 0.05)),
+    }
+    if result["median_camera_error_m"] > 0.03 or result["within_5cm_fraction"] < 0.8:
+        raise ReconstructionError(f"Physical camera alignment is inconsistent: {result}")
+    return result
 
 
 class ReconstructionPipeline:
-    """Full 3D reconstruction pipeline using COLMAP + Open3D."""
-
     def __init__(self, session_dir: Path, session_id: str, custom_output_dir: Path = None):
-        self.session_dir = session_dir
+        self.session_dir = Path(session_dir)
         self.session_id = session_id
-        self.images_dir = session_dir / "images"
-        self.depth_dir = session_dir / "depth"
-        self.colmap_dir = session_dir / "colmap"
-        self.output_dir = custom_output_dir if custom_output_dir else session_dir / "output"
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.images_dir = self.session_dir / "colmap" / "images"
+        self.colmap_dir = self.session_dir / "colmap"
+        self.output_dir = Path(custom_output_dir) if custom_output_dir else EXPORTS_DIR / session_id
         self.quality = "medium"
         self.progress_cb = None
+        self.timings = {}
+        self.logs = {}
 
-    def run_full_pipeline(self, use_colmap: bool = True, quality: str = "medium", progress_cb=None) -> dict:
-        """Run the complete reconstruction pipeline."""
-        self.quality = quality
-        self.progress_cb = progress_cb
-        
-        logger.info(f"Starting full pipeline for session: {self.session_id} (Quality: {quality})")
-        if self.progress_cb: self.progress_cb(5, "Starting Full Pipeline")
-        result = {"session_id": self.session_id, "status": "started", "exports": []}
+    def _progress(self, value, step):
+        if self.progress_cb:
+            self.progress_cb(value, step)
 
+    def _step(self, name, args, timeout, checkpoint=None, required=()):
+        if checkpoint is not None and checkpoint.exists() and all(path.exists() for path in required):
+            self.logs[name] = "cached"
+            self.timings[name] = 0.0
+            return
+        if checkpoint is not None:
+            checkpoint.unlink(missing_ok=True)
+            for later in STAGES[STAGES.index(name) + 1:]:
+                (self.run_dir / f"{later}.ok").unlink(missing_ok=True)
+        started = time.perf_counter()
+        logger.info("COLMAP %s", name)
         try:
-            exports = []
-            # Step 1: Try COLMAP if available
-            colmap_success = False
-            if use_colmap:
-                colmap_success = self._run_colmap()
-                
-            if colmap_success:
-                # Dışa aktar (Dense Point Cloud, vs.)
-                colmap_exports = self._export_colmap_raw()
-                exports.extend(colmap_exports)
+            result = subprocess.run(args, capture_output=True, text=True,
+                                    encoding="utf-8", errors="replace", timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            raise ReconstructionError(f"{name} timed out after {timeout}s") from exc
+        elapsed = round(time.perf_counter() - started, 2)
+        self.timings[name] = elapsed
+        output = (result.stdout or "") + "\n" + (result.stderr or "")
+        log_path = self.run_dir / f"{name}.log"
+        atomic_write(log_path, output.encode("utf-8"))
+        self.logs[name] = str(log_path)
+        if result.returncode:
+            raise ReconstructionError(f"{name} failed (exit {result.returncode}): {output[-600:]}")
+        if any(not path.exists() for path in required):
+            raise ReconstructionError(f"{name} finished without required output")
+        if checkpoint is not None:
+            atomic_write(checkpoint, b"ok\n")
 
-            # Step 2: Depth-based reconstruction (always available)
-            if self.progress_cb: self.progress_cb(60, "Depth Reconstruction")
-            mesh = self._reconstruct_from_depth()
+    def _load_session(self):
+        path = self.session_dir / "session_metadata.json"
+        if not path.exists():
+            raise ReconstructionError("captured session metadata is missing")
+        raw = path.read_bytes()
+        metadata = json.loads(raw)
+        if metadata.get("protocol_version") != 2 or metadata.get("status") != "captured":
+            raise ReconstructionError("Only finalized MSF2 physical-camera sessions can produce metric exports")
+        frames = metadata.get("frames", [])
+        if not MIN_FRAMES_FOR_RECONSTRUCTION <= len(frames) <= MAX_FRAMES_FOR_RECONSTRUCTION:
+            raise ReconstructionError(f"Expected {MIN_FRAMES_FOR_RECONSTRUCTION}–{MAX_FRAMES_FOR_RECONSTRUCTION} frames; got {len(frames)}")
+        if not metadata.get("intrinsics") or len({frame["camera_id"] for frame in frames}) != 1:
+            raise ReconstructionError("Fixed physical camera calibration is required")
+        if any(not (self.images_dir / frame["image"]).is_file() for frame in frames):
+            raise ReconstructionError("COLMAP input is incomplete")
+        for frame in frames:
+            expected = frame.get("image_sha256")
+            if not expected or len(expected) != 64:
+                raise ReconstructionError("Captured image checksum is missing")
+            for image_path in (self.session_dir / "images" / frame["image"],
+                               self.images_dir / frame["image"]):
+                if not image_path.is_file() or hashlib.sha256(image_path.read_bytes()).hexdigest() != expected:
+                    raise ReconstructionError(f"Captured image changed or is missing: {frame['image']}")
+        return metadata, raw
 
-            if mesh is not None:
-                # Step 3: Export to multiple formats
-                if self.progress_cb: self.progress_cb(80, "Exporting Models")
-                mesh_exports = self._export_mesh(mesh)
-                # Sadece yeni formatları ekle (aynı isimde dosya eklendiyse listeyi güncelle)
-                for me in mesh_exports:
-                    if not any(e["filename"] == me["filename"] for e in exports):
-                        exports.append(me)
-
-            if len(exports) > 0:
-                result["exports"] = exports
-                result["status"] = "completed"
-                if self.progress_cb: self.progress_cb(100, "Completed")
-                logger.info(f"Pipeline completed: {len(exports)} exports")
-            else:
-                result["status"] = "failed"
-                result["error"] = "No reconstruction method produced outputs"
-                if self.progress_cb: self.progress_cb(0, "Failed")
-
-        except Exception as e:
-            logger.error(f"Pipeline error: {e}", exc_info=True)
-            result["status"] = "failed"
-            result["error"] = str(e)
-            if self.progress_cb: self.progress_cb(0, "Failed")
-
+    def run_colmap_pipeline(self, quality="medium", progress_cb=None):
+        self.quality, self.progress_cb = quality, progress_cb
+        result = {"session_id": self.session_id, "method": "colmap",
+                  "status": "failed", "exports": [], "timings_seconds": self.timings}
+        try:
+            if quality not in ("low", "medium", "high"):
+                raise ReconstructionError("Unsupported quality preset")
+            binary = Path(COLMAP_BINARY)
+            if not binary.is_file():
+                raise ReconstructionError(f"COLMAP binary missing: {binary}")
+            metadata, raw_metadata = self._load_session()
+            identity = hashlib.sha256(raw_metadata + PIPELINE_VERSION.encode()
+                                      + quality.encode() + str(binary.stat().st_mtime_ns).encode()).hexdigest()[:16]
+            self.run_dir = self.colmap_dir / "runs" / identity
+            self.run_dir.mkdir(parents=True, exist_ok=True)
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            result["run_id"] = identity
+            result["alignment_validation"] = self._run_colmap(str(binary), metadata)
+            result["alignment"] = "pca_camera_centres_metric"
+            result["exports"], result["mesh_validation"] = self._export_metric_mesh(metadata)
+            if not result["exports"]:
+                raise ReconstructionError("No validated mesh exports were produced")
+            result["status"] = "completed"
+            self._progress(100, "Completed")
+        except (ReconstructionError, OSError, ValueError, KeyError) as exc:
+            result["error"] = str(exc)
+            logger.exception("Reconstruction failed for %s", self.session_id)
+            self._progress(0, "Failed: " + str(exc)[:100])
+        result["timings_seconds"] = self.timings
+        result["logs"] = self.logs
+        if self.output_dir.exists():
+            atomic_write(self.output_dir / "reconstruction_result.json",
+                         json.dumps(result, indent=2, default=str).encode("utf-8"))
         return result
 
-    def _export_colmap_raw(self) -> list[dict]:
-        """Copy COLMAP raw outputs (fused.ply, meshed-poisson.ply) to the exports directory."""
-        from config import EXPORTS_DIR
-        export_dir = EXPORTS_DIR / self.session_id
-        export_dir.mkdir(parents=True, exist_ok=True)
-        
+    def _run_colmap(self, binary, metadata):
+        frames = metadata["frames"]
+        intr = metadata["intrinsics"]
+        db = self.run_dir / "database.db"
+        sparse = self.run_dir / "sparse"
+        aligned = self.run_dir / "aligned"
+        dense = self.run_dir / "dense"
+        sparse.mkdir(exist_ok=True)
+        aligned.mkdir(exist_ok=True)
+        dense.mkdir(exist_ok=True)
+        max_features = {"low": 4096, "medium": 8192, "high": 16384}[self.quality]
+        image_size = max(intr["width"], intr["height"])
+        work_size = min(image_size, 960) if self.quality == "low" else image_size
+        stereo_iterations = {"low": 3, "medium": 5, "high": 7}[self.quality]
+        stereo_samples = {"low": 10, "medium": 15, "high": 20}[self.quality]
+        poisson_depth = {"low": 9, "medium": 10, "high": 11}[self.quality]
+        params = ",".join(str(intr[key]) for key in ("fx", "fy", "cx", "cy"))
+        self._progress(10, "GPU SIFT feature extraction")
+        self._step("features", [
+            binary, "feature_extractor", "--database_path", str(db),
+            "--image_path", str(self.images_dir), "--ImageReader.single_camera", "1",
+            "--ImageReader.camera_model", "PINHOLE", "--ImageReader.camera_params", params,
+            "--FeatureExtraction.use_gpu", "1",
+            "--FeatureExtraction.max_image_size", str(work_size),
+            "--SiftExtraction.max_num_features", str(max_features),
+            "--SiftExtraction.domain_size_pooling", "0",
+        ], 1200, self.run_dir / "features.ok", (db,))
+
+        pairs = make_match_pairs(frames)
+        if len(pairs) < len(frames) - 1:
+            raise ReconstructionError("Insufficient candidate image pairs")
+        pair_path = self.run_dir / "pairs.txt"
+        atomic_write(pair_path, "".join(f"{a} {b}\n" for a, b in pairs).encode())
+        self._progress(22, f"GPU matching ({len(pairs)} candidate pairs)")
+        self._step("matching", [
+            binary, "matches_importer", "--database_path", str(db),
+            "--match_list_path", str(pair_path), "--match_type", "pairs",
+            "--FeatureMatching.use_gpu", "1",
+        ], 1800, self.run_dir / "matching.ok", (db,))
+
+        self._progress(38, "Sparse reconstruction")
+        mapper_ok = self.run_dir / "mapper.ok"
+        model = sparse / "0"
+        if not mapper_ok.exists() or not (model / "points3D.bin").is_file():
+            _safe_reset(sparse, self.run_dir)
+        self._step("mapper", [
+            binary, "mapper", "--database_path", str(db), "--image_path", str(self.images_dir),
+            "--output_path", str(sparse), "--Mapper.ba_use_gpu", "0",
+            "--Mapper.ba_refine_focal_length", "0",
+            "--Mapper.ba_refine_principal_point", "0",
+            "--Mapper.ba_refine_extra_params", "0",
+        ], 2400, mapper_ok, (model / "points3D.bin",))
+        if not (model / "points3D.bin").is_file():
+            raise ReconstructionError("COLMAP did not register a sparse model")
+
+        # COLMAP scale is arbitrary until its camera centres are aligned to
+        # PCA physical camera positions. Flip world Z to keep Y up in a RH world.
+        ref_path = self.run_dir / "camera_centres.txt"
+        ref_lines = []
+        for frame in frames:
+            p = frame["pose"]["position"]
+            ref_lines.append(f"{frame['image']} {p['x']} {p['y']} {-p['z']}\n")
+        atomic_write(ref_path, "".join(ref_lines).encode())
+        self._progress(48, "Metric camera alignment")
+        align_ok = self.run_dir / "aligned.ok"
+        if not align_ok.exists() or not (aligned / "points3D.bin").is_file():
+            _safe_reset(aligned, self.run_dir)
+        self._step("aligned", [
+            binary, "model_aligner", "--input_path", str(model), "--output_path", str(aligned),
+            "--ref_images_path", str(ref_path), "--ref_is_gps", "0",
+            "--alignment_type", "custom", "--alignment_max_error", "0.05",
+            "--min_common_images", "5",
+        ], 300, align_ok, (aligned / "points3D.bin",))
+        if not (aligned / "points3D.bin").is_file():
+            raise ReconstructionError("Metric alignment produced no model")
+        aligned_text = self.run_dir / "aligned_text"
+        aligned_text.mkdir(exist_ok=True)
+        self._step("alignment_text", [
+            binary, "model_converter", "--input_path", str(aligned),
+            "--output_path", str(aligned_text), "--output_type", "TXT",
+        ], 120, self.run_dir / "alignment_text.ok", (aligned_text / "images.txt",))
+        alignment_validation = evaluate_metric_alignment(aligned_text / "images.txt", frames)
+
+        self._progress(58, "Undistorting calibrated images")
+        undistort_ok = self.run_dir / "undistort.ok"
+        if not undistort_ok.exists() or not (dense / "images").is_dir():
+            _safe_reset(dense, self.run_dir)
+        self._step("undistort", [
+            binary, "image_undistorter", "--image_path", str(self.images_dir),
+            "--input_path", str(aligned), "--output_path", str(dense),
+            "--output_type", "COLMAP", "--max_image_size", str(work_size),
+        ], 600, undistort_ok, (dense / "images",))
+        self._progress(68, "GPU dense stereo")
+        self._step("stereo", [
+            binary, "patch_match_stereo", "--workspace_path", str(dense),
+            "--workspace_format", "COLMAP", "--PatchMatchStereo.geom_consistency", "true",
+            "--PatchMatchStereo.max_image_size", str(work_size),
+            "--PatchMatchStereo.num_iterations", str(stereo_iterations),
+            "--PatchMatchStereo.num_samples", str(stereo_samples),
+        ], 3600, self.run_dir / "stereo.ok", (dense / "stereo" / "depth_maps",))
+        fused = dense / "fused.ply"
+        self._progress(83, "Dense point fusion")
+        mask_dir = make_roi_masks(metadata, self.run_dir / "roi_masks")
+        fusion_command = [
+            binary, "stereo_fusion", "--workspace_path", str(dense),
+            "--workspace_format", "COLMAP", "--input_type", "geometric",
+            "--output_path", str(fused),
+        ]
+        if mask_dir is not None:
+            fusion_command += ["--StereoFusion.mask_path", str(mask_dir)]
+        if fused.is_file() and fused.stat().st_size < 1000:
+            (self.run_dir / "fusion.ok").unlink(missing_ok=True)
+        self._step("fusion", fusion_command, 1200, self.run_dir / "fusion.ok", (fused,))
+        if not fused.is_file() or fused.stat().st_size < 1000:
+            raise ReconstructionError("Dense stereo yielded no usable point cloud")
+        mesh_path = dense / "meshed-poisson.ply"
+        self._progress(91, "Poisson surface meshing")
+        if mesh_path.is_file() and mesh_path.stat().st_size < 1000:
+            (self.run_dir / "meshing.ok").unlink(missing_ok=True)
+        self._step("meshing", [
+            binary, "poisson_mesher", "--input_path", str(fused),
+            "--output_path", str(mesh_path), "--PoissonMeshing.depth", str(poisson_depth),
+        ], 1800, self.run_dir / "meshing.ok", (mesh_path,))
+        if not mesh_path.is_file() or mesh_path.stat().st_size < 1000:
+            raise ReconstructionError("Meshing yielded no usable triangles")
+        return alignment_validation
+
+    def _export_metric_mesh(self, metadata):
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        source = self.run_dir / "dense" / "meshed-poisson.ply"
+        mesh = trimesh.load(source, force="mesh", process=False)
+        if not isinstance(mesh, trimesh.Trimesh) or len(mesh.faces) < 100:
+            raise ReconstructionError("Mesher returned insufficient triangles")
         exports = []
-        dense_dir = self.colmap_dir / "workspace" / "dense"
-        
-        # 1. Dense Point Cloud (fused.ply)
-        fused_path = dense_dir / "fused.ply"
-        if fused_path.exists() and fused_path.stat().st_size > 1000:
-            out_path = export_dir / f"{self.session_id}_dense_cloud.ply"
-            try:
-                shutil.copy2(str(fused_path), str(out_path))
-                exports.append({
-                    "format": "PLY (Dense Point Cloud)",
-                    "filename": out_path.name,
-                    "path": str(out_path),
-                    "size_mb": round(out_path.stat().st_size / (1024 * 1024), 2),
-                    "url": f"/exports/{self.session_id}/{out_path.name}",
-                })
-                logger.info(f"Exported COLMAP dense cloud: {out_path.name}")
-            except Exception as e:
-                logger.error(f"Failed to copy fused.ply: {e}")
-                
-        # 2. Meshed Poisson (if user or system created it via COLMAP)
-        poisson_path = dense_dir / "meshed-poisson.ply"
-        if poisson_path.exists() and poisson_path.stat().st_size > 1000:
-            out_path = export_dir / f"{self.session_id}_colmap_mesh.ply"
-            try:
-                shutil.copy2(str(poisson_path), str(out_path))
-                exports.append({
-                    "format": "PLY (COLMAP Mesh)",
-                    "filename": out_path.name,
-                    "path": str(out_path),
-                    "size_mb": round(out_path.stat().st_size / (1024 * 1024), 2),
-                    "url": f"/exports/{self.session_id}/{out_path.name}",
-                })
-                logger.info(f"Exported COLMAP poisson mesh: {out_path.name}")
-            except Exception as e:
-                logger.error(f"Failed to copy meshed-poisson.ply: {e}")
-                
-        return exports
-
-    def _run_colmap(self) -> bool:
-        """Run COLMAP Structure-from-Motion."""
-        from config import (
-            COLMAP_BINARY, COLMAP_USE_KNOWN_POSES, COLMAP_FIX_INTRINSICS
-        )
-
-        if self.progress_cb: self.progress_cb(10, "Initializing COLMAP Workspace")
-
-        colmap_path = shutil.which(COLMAP_BINARY)
-        if colmap_path is None:
-            logger.warning("COLMAP not found in PATH. Skipping COLMAP step.")
-            return False
-
-        colmap_workspace = self.colmap_dir / "workspace"
-        colmap_workspace.mkdir(parents=True, exist_ok=True)
-        colmap_db = colmap_workspace / "database.db"
-        colmap_sparse = colmap_workspace / "sparse"
-        colmap_dense = colmap_workspace / "dense"
-        colmap_sparse.mkdir(exist_ok=True)
-        colmap_dense.mkdir(exist_ok=True)
-
-        colmap_images_dir = self.colmap_dir / "images"
-        if not colmap_images_dir.exists() or len(list(colmap_images_dir.iterdir())) == 0:
-            logger.warning("No COLMAP images found. Skipping COLMAP.")
-            return False
-
-        # Quality settings mapping (matching COLMAP's internal presets)
-        if self.quality == "low":
-            sift_features = "4096"
-            feature_max_size = "1000"
-            patch_match_max_size = "1000"
-        elif self.quality == "medium":
-            sift_features = "8192"
-            feature_max_size = "2000"
-            patch_match_max_size = "2000"
-        elif self.quality == "high":
-            sift_features = "16384"
-            feature_max_size = "3200"
-            patch_match_max_size = "3200"
-        elif self.quality == "extreme":
-            sift_features = "32768"
-            feature_max_size = "-1"  # Do not resize
-            patch_match_max_size = "-1"
-        else: # Fallback
-            sift_features = "8192"
-            feature_max_size = "2000"
-            patch_match_max_size = "2000"
-
-        # Load known intrinsics from session (if available)
-        intrinsics_path = self.session_dir / "intrinsics.json"
-        camera_params = None
-        if intrinsics_path.exists():
-            with open(intrinsics_path) as f:
-                intr = json.load(f)
-            camera_params = f"{intr['fx']},{intr['fy']},{intr['cx']},{intr['cy']}"
-            logger.info(f"Using known intrinsics: {camera_params}")
-
-        try:
-            # ── Step 0: Clean up previous runs ──
-            if colmap_db.exists():
-                logger.info("COLMAP: Cleaning up previous database...")
-                colmap_db.unlink()
-                
-            # ── Step 1: Feature extraction (with known intrinsics if available) ──
-            logger.info("COLMAP: Feature extraction...")
-            if self.progress_cb: self.progress_cb(15, "COLMAP: Feature Extraction")
-            feat_cmd = [
-                colmap_path, "feature_extractor",
-                "--database_path", str(colmap_db),
-                "--image_path", str(colmap_images_dir),
-                "--ImageReader.single_camera", "1",
-                "--ImageReader.camera_model", "PINHOLE",
-                # ── GPU etkin ──
-                "--FeatureExtraction.use_gpu", "1",
-                # ── Quality Settings ──
-                "--FeatureExtraction.max_image_size", feature_max_size,
-                "--SiftExtraction.max_num_features", sift_features,
-                # ── Enhanced SIFT for low-contrast passthrough images ──
-                "--SiftExtraction.first_octave", "-1",        # Sub-pixel features
-                "--SiftExtraction.peak_threshold", "0.004",   # Lower peak threshold → more features
-                "--SiftExtraction.edge_threshold", "16",      # Allow weaker edge features
-                "--SiftExtraction.domain_size_pooling", "1",  # Better descriptor quality
-            ]
-            if camera_params and COLMAP_FIX_INTRINSICS:
-                feat_cmd += ["--ImageReader.camera_params", camera_params]
-            subprocess.run(feat_cmd, check=True, capture_output=True, timeout=600)
-
-            # ── Step 2: Feature matching (exhaustive for better coverage) ──
-            logger.info("COLMAP: Exhaustive feature matching...")
-            if self.progress_cb: self.progress_cb(25, "COLMAP: Feature Matching")
-            subprocess.run([
-                colmap_path, "exhaustive_matcher",
-                "--database_path", str(colmap_db),
-                "--FeatureMatching.use_gpu", "1",
-                "--ExhaustiveMatching.block_size", "50",
-            ], check=True, capture_output=True, timeout=1200)
-
-            # ── Step 3: Reconstruction ──
-            if self.progress_cb: self.progress_cb(35, "COLMAP: Sparse Reconstruction")
-            known_model_dir = self.colmap_dir  # Contains cameras.txt, images.txt, points3D.txt
-            cameras_txt = known_model_dir / "cameras.txt"
-            images_txt = known_model_dir / "images.txt"
-
-            # Quest'ten gelen pose'ları (known poses) şimdilik zorla devre dışı bırakıyoruz.
-            # Çünkü manuel COLMAP kullanımında sorun çıkmıyorken, buradaki "known poses" bin dosyası GPU mapper'ı çökertiyor olabilir.
-            USE_KNOWN_POSES_TEMP = False
-
-            if USE_KNOWN_POSES_TEMP and COLMAP_USE_KNOWN_POSES and cameras_txt.exists() and images_txt.exists():
-                pass # Bu blok şimdilik atlandı.
-            else:
-                # ── No known poses — full mapper from scratch ──
-                logger.info("COLMAP: Mapper from scratch (no known poses)...")
-                try:
-                    subprocess.run([
-                        colmap_path, "mapper",
-                        "--database_path", str(colmap_db),
-                        "--image_path", str(colmap_images_dir),
-                        "--output_path", str(colmap_sparse),
-                        "--Mapper.ba_use_gpu", "1"
-                    ], check=True, capture_output=True, timeout=1200)
-                except subprocess.CalledProcessError as e:
-                    stderr_text = e.stderr.decode('utf-8', errors='replace') if e.stderr else ''
-                    stdout_text = e.stdout.decode('utf-8', errors='replace') if e.stdout else ''
-                    logger.error(f"Mapper crashed!\nExit Code: {e.returncode}\nSTDERR: {stderr_text}\nSTDOUT: {stdout_text[-1000:]}")
-                    raise e
-            # ── Export sparse reconstruction to PLY ──
-            try:
-                ply_path = colmap_workspace / "model.ply"
-                
-                # Mapper puts it in '0/', point_triangulator puts it directly in sparse/
-                input_dir = colmap_sparse / "0"
-                if not input_dir.exists():
-                    input_dir = colmap_sparse
-                    
-                if (input_dir / "points3D.bin").exists() or (input_dir / "points3D.txt").exists():
-                    logger.info(f"COLMAP: Exporting sparse reconstruction to PLY from {input_dir}...")
-                    subprocess.run([
-                        colmap_path, "model_converter",
-                        "--input_path", str(input_dir),
-                        "--output_path", str(ply_path),
-                        "--output_type", "PLY"
-                    ], check=True, capture_output=True, timeout=120)
-                    logger.info("COLMAP: Sparse reconstruction exported to PLY")
-                else:
-                    logger.warning(f"No COLMAP points3D found in {input_dir}")
-            except Exception as e:
-                logger.warning(f"Failed to export COLMAP PLY: {e}")
-
-            # ── Dense reconstruction: undistort → patch_match → fusion ──
-            try:
-                if self.progress_cb: self.progress_cb(45, "COLMAP: Undistorting Images")
-                # Find the sparse model directory (mapper uses 0/, triangulator uses sparse/)
-                sparse_model_dir = colmap_sparse / "0"
-                if not sparse_model_dir.exists():
-                    sparse_model_dir = colmap_sparse
-
-                # Step A: Undistort images
-                logger.info("COLMAP: Undistorting images for dense reconstruction...")
-                subprocess.run([
-                    colmap_path, "image_undistorter",
-                    "--image_path", str(colmap_images_dir),
-                    "--input_path", str(sparse_model_dir),
-                    "--output_path", str(colmap_dense),
-                    "--output_type", "COLMAP",
-                ], check=True, capture_output=True, timeout=300)
-
-                if self.progress_cb: self.progress_cb(50, "COLMAP: Dense Depth Estimation")
-                # Step B: Stereo matching (depth estimation per image pair)
-                logger.info("COLMAP: Patch match stereo (dense depth estimation)...")
-                patch_cmd = [
-                    colmap_path, "patch_match_stereo",
-                    "--workspace_path", str(colmap_dense),
-                    "--workspace_format", "COLMAP",
-                    "--PatchMatchStereo.geom_consistency", "true",
-                    "--PatchMatchStereo.max_image_size", patch_match_max_size,
-                ]
-                # Try GPU first, fall back to CPU-compatible settings
-                subprocess.run(patch_cmd, check=True, capture_output=True, timeout=1800)
-
-                if self.progress_cb: self.progress_cb(55, "COLMAP: Stereo Fusion")
-                # Step C: Stereo fusion (merge depth maps into dense point cloud)
-                dense_ply_path = colmap_dense / "fused.ply"
-                logger.info("COLMAP: Stereo fusion (merging depth maps)...")
-                subprocess.run([
-                    colmap_path, "stereo_fusion",
-                    "--workspace_path", str(colmap_dense),
-                    "--workspace_format", "COLMAP",
-                    "--output_path", str(dense_ply_path),
-                    "--StereoFusion.min_num_pixels", "3",
-                ], check=True, capture_output=True, timeout=600)
-
-                if dense_ply_path.exists() and dense_ply_path.stat().st_size > 1000:
-                    logger.info(f"COLMAP: Dense point cloud created: {dense_ply_path}")
-                else:
-                    logger.warning("COLMAP: Dense fusion produced empty or tiny output")
-
-            except subprocess.CalledProcessError as e:
-                stderr_text = e.stderr.decode('utf-8', errors='replace') if e.stderr else ''
-                logger.warning(f"COLMAP dense reconstruction failed: {e}. stderr: {stderr_text[:500]}")
-            except subprocess.TimeoutExpired:
-                logger.warning("COLMAP dense reconstruction timed out")
-            except Exception as e:
-                logger.warning(f"COLMAP dense reconstruction error: {e}")
-
-            logger.info("COLMAP: Sparse reconstruction completed")
-            return True
-
-        except FileNotFoundError:
-            logger.warning("COLMAP binary not found")
-            return False
-        except subprocess.TimeoutExpired:
-            logger.warning("COLMAP timed out")
-            return False
-        except subprocess.CalledProcessError as e:
-            logger.warning(f"COLMAP failed: {e}")
-            return False
-
-    def _reconstruct_from_depth(self):
-        """Reconstruct mesh from depth maps using Open3D TSDF fusion."""
-        try:
-            import open3d as o3d
-        except ImportError:
-            logger.warning("Open3D not installed. Skipping depth-based reconstruction.")
-            return None
-
-        from config import (
-            TSDF_VOXEL_LENGTH, TSDF_SDF_TRUNC,
-            TSDF_DEPTH_SCALE, TSDF_DEPTH_MAX,
-            CAMERA_WIDTH, CAMERA_HEIGHT,
-            TARGET_FACE_COUNT
-        )
-
-        # Load session metadata
-        meta_path = self.session_dir / "session_metadata.json"
-        if not meta_path.exists():
-            logger.warning("No session metadata found")
-            return None
-
-        with open(meta_path) as f:
-            metadata = json.load(f)
-
-        frames = metadata.get("frames", [])
-        intrinsics_data = metadata.get("intrinsics")
-
-        if not intrinsics_data:
-            logger.warning("No camera intrinsics available")
-            return None
-
-        # Check if we have depth maps
-        depth_files = list(self.depth_dir.glob("depth_*.raw"))
-        if len(depth_files) == 0:
-            logger.info("No depth maps available. Checking for COLMAP reconstruction.")
-            
-            if self.progress_cb: self.progress_cb(65, "Processing Dense Output")
-            # Check dense PLY first (much better quality)
-            dense_ply = self.colmap_dir / "workspace" / "dense" / "fused.ply"
-            colmap_ply = self.colmap_dir / "workspace" / "model.ply"
-            
-            ply_to_use = None
-            if dense_ply.exists() and dense_ply.stat().st_size > 1000:
-                ply_to_use = dense_ply
-                logger.info("Using COLMAP dense point cloud (fused.ply)")
-            elif colmap_ply.exists():
-                ply_to_use = colmap_ply
-                logger.info("Using COLMAP sparse point cloud (model.ply)")
-            
-            if ply_to_use is not None:
-                try:
-                    pcd = o3d.io.read_point_cloud(str(ply_to_use))
-                    logger.info(f"Loaded point cloud: {len(pcd.points)} points")
-                    
-                    if self.progress_cb: self.progress_cb(70, "Refining Point Cloud")
-                    # COLMAP sometimes exports pitch-black colors
-                    if pcd.has_colors():
-                        if np.mean(np.asarray(pcd.colors)) < 0.01:
-                            logger.info("Stripping black colors to allow viewer fallback color.")
-                            pcd.colors = o3d.utility.Vector3dVector()
-                            
-                    # Remove outliers
-                    if len(pcd.points) > 100:
-                        logger.info(f"Removing outliers from {len(pcd.points)} points...")
-                        nb = min(50, max(10, len(pcd.points) // 20))
-                        pcd, ind = pcd.remove_statistical_outlier(nb_neighbors=nb, std_ratio=1.5)
-                        logger.info(f"Cleaned point cloud has {len(pcd.points)} points.")
-                    
-                    # Try Poisson surface reconstruction if we have enough points
-                    if len(pcd.points) > 5000:
-                        try:
-                            if self.progress_cb: self.progress_cb(75, "Poisson Surface Reconstruction")
-                            logger.info("Attempting Poisson surface reconstruction...")
-                            # Estimate normals
-                            pcd.estimate_normals(
-                                search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.02, max_nn=30)
-                            )
-                            pcd.orient_normals_consistent_tangent_plane(k=15)
-                            
-                            mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
-                                pcd, depth=9, width=0, scale=1.1, linear_fit=False
-                            )
-                            
-                            # Remove low-density vertices (noise)
-                            densities_np = np.asarray(densities)
-                            density_threshold = np.quantile(densities_np, 0.05)
-                            vertices_to_remove = densities_np < density_threshold
-                            mesh.remove_vertices_by_mask(vertices_to_remove)
-                            mesh.compute_vertex_normals()
-                            
-                            if len(mesh.triangles) > 100:
-                                logger.info(f"Poisson mesh: {len(mesh.vertices)} vertices, {len(mesh.triangles)} faces")
-                                return mesh
-                            else:
-                                logger.warning("Poisson mesh too sparse, returning point cloud")
-                        except Exception as e:
-                            logger.warning(f"Poisson reconstruction failed: {e}")
-                    
-                    return pcd
-                except Exception as e:
-                    logger.warning(f"Failed to load COLMAP PLY: {e}")
-            
-            logger.info("Trying point cloud from poses.")
-            return self._reconstruct_from_images_only(frames, intrinsics_data)
-
-        # Setup Open3D intrinsics
-        o3d_intrinsics = o3d.camera.PinholeCameraIntrinsic(
-            width=intrinsics_data["width"],
-            height=intrinsics_data["height"],
-            fx=intrinsics_data["fx"],
-            fy=intrinsics_data["fy"],
-            cx=intrinsics_data["cx"],
-            cy=intrinsics_data["cy"],
-        )
-
-        # TSDF Volume
-        if self.progress_cb: self.progress_cb(65, "TSDF Fusion")
-        logger.info("Starting TSDF fusion...")
-        volume = o3d.pipelines.integration.ScalableTSDFVolume(
-            voxel_length=TSDF_VOXEL_LENGTH,
-            sdf_trunc=TSDF_SDF_TRUNC,
-            color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8,
-        )
-
-        integrated_count = 0
-        total_frames = len(frames)
-        for i, frame in enumerate(frames):
-            if self.progress_cb and i % 10 == 0: 
-                prog = 65 + int(10 * (i / total_frames))
-                self.progress_cb(prog, f"TSDF Fusion ({i}/{total_frames})")
-
-            depth_file = frame.get("depth")
-            if depth_file is None:
-                continue
-
-            depth_path = self.depth_dir / depth_file
-            image_path = self.images_dir / frame["image"]
-
-            if not depth_path.exists() or not image_path.exists():
-                continue
-
-            pose = frame.get("pose")
-            if pose is None:
-                continue
-
-            # Load depth (uint16, mm)
-            raw_depth = np.fromfile(str(depth_path), dtype=np.uint16)
-            expected_size = CAMERA_WIDTH * CAMERA_HEIGHT
-            if raw_depth.size != expected_size:
-                # Try to reshape with actual dimensions
-                sqrt_size = int(np.sqrt(raw_depth.size))
-                if sqrt_size * sqrt_size == raw_depth.size:
-                    depth_image = raw_depth.reshape(sqrt_size, sqrt_size)
-                else:
-                    continue
-            else:
-                depth_image = raw_depth.reshape(CAMERA_HEIGHT, CAMERA_WIDTH)
-
-            # Load color
-            color_bgr = cv2.imread(str(image_path))
-            if color_bgr is None:
-                continue
-            color_rgb = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2RGB)
-
-            # Resize if needed
-            if color_rgb.shape[:2] != depth_image.shape[:2]:
-                color_rgb = cv2.resize(
-                    color_rgb,
-                    (depth_image.shape[1], depth_image.shape[0])
-                )
-
-            # Create Open3D images
-            o3d_depth = o3d.geometry.Image(depth_image.astype(np.float32))
-            o3d_color = o3d.geometry.Image(color_rgb)
-            rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
-                o3d_color, o3d_depth,
-                depth_scale=TSDF_DEPTH_SCALE,
-                depth_trunc=TSDF_DEPTH_MAX,
-                convert_rgb_to_intensity=False,
-            )
-
-            # Build world-to-camera extrinsic matrix from pose
-            extrinsic = self._pose_to_extrinsic(pose)
-
-            # Integrate (extrinsic is already world-to-camera)
-            volume.integrate(rgbd, o3d_intrinsics, extrinsic)
-            integrated_count += 1
-
-        if integrated_count == 0:
-            logger.warning("No frames could be integrated")
-            return None
-
-        logger.info(f"TSDF fusion complete: {integrated_count} frames integrated")
-
-        # Extract mesh
-        if self.progress_cb: self.progress_cb(75, "Extracting TSDF Mesh")
-        mesh = volume.extract_triangle_mesh()
-        mesh.compute_vertex_normals()
-
-        # Simplify if too many faces
-        if len(mesh.triangles) > TARGET_FACE_COUNT:
-            if self.progress_cb: self.progress_cb(78, "Simplifying Mesh")
-            logger.info(
-                f"Simplifying mesh: {len(mesh.triangles)} → {TARGET_FACE_COUNT} faces"
-            )
-            mesh = mesh.simplify_quadric_decimation(TARGET_FACE_COUNT)
-            mesh.compute_vertex_normals()
-
-        return mesh
-
-    def _reconstruct_from_images_only(self, frames: list, intrinsics_data: dict):
-        """Fallback when no depth maps and no COLMAP models are found.
-        We no longer generate trajectory maps as they confuse the user."""
-        logger.warning("No valid depth or COLMAP models found. Returning None.")
-        return None
-
-    def _pose_to_extrinsic(self, pose: dict) -> np.ndarray:
-        """
-        Unity camera-to-world → Open3D world-to-camera extrinsic matrix.
-
-        Applies:
-        1. Coordinate conversion: Unity (left-handed, Y-up) → Open3D (right-handed, Y-down)
-        2. Pose inversion: camera-to-world → world-to-camera
-
-        Returns 4x4 world-to-camera matrix ready for Open3D integrate().
-        """
-        pos = pose["position"]
-        rot = pose["rotation"]
-
-        # Unity left-handed → right-handed: flip Y
-        qx = -rot["x"]
-        qy =  rot["y"]
-        qz = -rot["z"]
-        qw =  rot["w"]
-
-        px =  pos["x"]
-        py = -pos["y"]
-        pz =  pos["z"]
-
-        # Rotation matrix (camera-to-world in right-handed coords)
-        R_c2w = Rotation.from_quat([qx, qy, qz, qw]).as_matrix()
-        t_c2w = np.array([px, py, pz])
-
-        # Invert to world-to-camera (what Open3D expects)
-        R_w2c = R_c2w.T
-        t_w2c = -R_w2c @ t_c2w
-
-        extrinsic = np.eye(4)
-        extrinsic[:3, :3] = R_w2c
-        extrinsic[:3,  3] = t_w2c
-
-        return extrinsic
-
-    def _export_mesh(self, mesh) -> list[dict]:
-        """Export mesh to multiple formats."""
-        try:
-            import open3d as o3d
-            import trimesh
-        except ImportError as e:
-            logger.error(f"Export dependency missing: {e}")
-            return []
-
-        from config import EXPORTS_DIR
-
-        export_dir = EXPORTS_DIR / self.session_id
-        export_dir.mkdir(parents=True, exist_ok=True)
-
-        exports = []
-
-        # Determine if it's a mesh or point cloud
-        is_pointcloud = not hasattr(mesh, 'triangles')
-
-        if is_pointcloud:
-            try:
-                ply_path = export_dir / f"{self.session_id}_points.ply"
-                o3d.io.write_point_cloud(str(ply_path), mesh)
-                exports.append({
-                    "format": "PLY",
-                    "filename": ply_path.name,
-                    "path": str(ply_path),
-                    "size_mb": round(ply_path.stat().st_size / (1024 * 1024), 2),
-                    "url": f"/exports/{self.session_id}/{ply_path.name}",
-                })
-                logger.info(f"Exported PLY point cloud: {ply_path.name}")
-            except Exception as e:
-                logger.error(f"PLY export failed: {e}")
-            return exports
-
-        # It's a triangle mesh, convert Open3D mesh to trimesh for multi-format export
-        vertices = np.asarray(mesh.vertices)
-        triangles = np.asarray(mesh.triangles)
-        vertex_colors = None
-        if mesh.has_vertex_colors():
-            vertex_colors = (np.asarray(mesh.vertex_colors) * 255).astype(np.uint8)
-
-        tri_mesh = trimesh.Trimesh(
-            vertices=vertices,
-            faces=triangles,
-            vertex_colors=vertex_colors,
-        )
-
-        # Export OBJ
-        try:
-            if self.progress_cb: self.progress_cb(82, "Exporting OBJ")
-            obj_path = export_dir / f"{self.session_id}.obj"
-            tri_mesh.export(str(obj_path), file_type="obj")
-            exports.append({
-                "format": "OBJ",
-                "filename": obj_path.name,
-                "path": str(obj_path),
-                "size_mb": round(obj_path.stat().st_size / (1024 * 1024), 2),
-                "url": f"/exports/{self.session_id}/{obj_path.name}",
-            })
-            logger.info(f"Exported OBJ: {obj_path.name}")
-        except Exception as e:
-            logger.error(f"OBJ export failed: {e}")
-
-        # Export STL
-        try:
-            if self.progress_cb: self.progress_cb(85, "Exporting STL")
-            stl_path = export_dir / f"{self.session_id}.stl"
-            tri_mesh.export(str(stl_path), file_type="stl")
-            exports.append({
-                "format": "STL",
-                "filename": stl_path.name,
-                "path": str(stl_path),
-                "size_mb": round(stl_path.stat().st_size / (1024 * 1024), 2),
-                "url": f"/exports/{self.session_id}/{stl_path.name}",
-            })
-            logger.info(f"Exported STL: {stl_path.name}")
-        except Exception as e:
-            logger.error(f"STL export failed: {e}")
-
-        # Export GLB
-        try:
-            if self.progress_cb: self.progress_cb(90, "Exporting GLB")
-            glb_path = export_dir / f"{self.session_id}.glb"
-            tri_mesh.export(str(glb_path), file_type="glb")
-            exports.append({
-                "format": "GLB",
-                "filename": glb_path.name,
-                "path": str(glb_path),
-                "size_mb": round(glb_path.stat().st_size / (1024 * 1024), 2),
-                "url": f"/exports/{self.session_id}/{glb_path.name}",
-            })
-            logger.info(f"Exported GLB: {glb_path.name}")
-        except Exception as e:
-            logger.error(f"GLB export failed: {e}")
-
-        # Export PLY
-        try:
-            if self.progress_cb: self.progress_cb(95, "Exporting PLY")
-            ply_path = export_dir / f"{self.session_id}.ply"
-            o3d.io.write_triangle_mesh(str(ply_path), mesh)
-            exports.append({
-                "format": "PLY",
-                "filename": ply_path.name,
-                "path": str(ply_path),
-                "size_mb": round(ply_path.stat().st_size / (1024 * 1024), 2),
-                "url": f"/exports/{self.session_id}/{ply_path.name}",
-            })
-            logger.info(f"Exported PLY: {ply_path.name}")
-        except Exception as e:
-            logger.error(f"PLY export failed: {e}")
-
-        return exports
-
-    def run_colmap_pipeline(self, export: bool = True, quality: str = "medium", progress_cb=None) -> dict:
-        """Run only COLMAP pipeline."""
-        self.quality = quality
-        self.progress_cb = progress_cb
-        
-        if self.progress_cb: self.progress_cb(5, "Starting COLMAP Pipeline")
-        success = self._run_colmap()
-        if self.progress_cb: self.progress_cb(100 if success else 0, "Completed" if success else "Failed")
-        return {
-            "session_id": self.session_id,
-            "status": "completed" if success else "failed",
-            "method": "colmap",
+        scene = self.output_dir / f"{self.session_id}_scene_metric.ply"
+        shutil.copy2(source, scene)
+        exports.append(self._descriptor(scene, "scene_ply_metres"))
+        roi = metadata.get("roi")
+        if roi:
+            center = roi["center"]
+            centre = np.array([center["x"], center["y"], -center["z"]], dtype=float)
+            radius = float(roi["radius"])
+            if not np.isfinite(centre).all() or not math.isfinite(radius) or not 0.01 <= radius <= 5:
+                raise ReconstructionError("Invalid object selection volume")
+            inside = np.linalg.norm(mesh.vertices - centre, axis=1) <= radius
+            face_mask = np.all(inside[mesh.faces], axis=1)
+            if np.count_nonzero(face_mask) < 100:
+                raise ReconstructionError("Object selection excludes the reconstructed mesh")
+            mesh.update_faces(face_mask)
+            mesh.remove_unreferenced_vertices()
+        if not np.isfinite(mesh.vertices).all():
+            raise ReconstructionError("Mesh contains non-finite vertices")
+        # Keep the reconstructed editable geometry distinct from print repair.
+        bounds_m = (mesh.bounds[1] - mesh.bounds[0]).tolist()
+        if min(bounds_m) <= 0 or max(bounds_m) > 10:
+            raise ReconstructionError("Implausible physical mesh dimensions")
+        validation = {
+            "units": "metres", "bounds_m": bounds_m,
+            "bounds_mm": (np.asarray(bounds_m) * 1000).tolist(),
+            "vertices": len(mesh.vertices), "faces": len(mesh.faces),
+            "watertight": bool(mesh.is_watertight),
+            "winding_consistent": bool(mesh.is_winding_consistent),
+            "volume_m3": float(mesh.volume) if mesh.is_watertight else None,
+            "roi_applied": bool(roi),
         }
+        for ext in ("obj", "glb", "ply"):
+            path = self.output_dir / f"{self.session_id}_object_editable.{ext}"
+            mesh.export(path)
+            exports.append(self._descriptor(path, f"editable_{ext}_metres"))
+        printable = mesh.copy()
+        printable.update_faces(printable.nondegenerate_faces())
+        printable.update_faces(printable.unique_faces())
+        printable.remove_unreferenced_vertices()
+        trimesh.repair.fix_normals(printable)
+        trimesh.repair.fill_holes(printable)
+        validation["repair_candidate_watertight"] = bool(printable.is_watertight)
+        validation["repair_candidate_volume_m3"] = float(printable.volume) if printable.is_watertight else None
+        if printable.is_volume and min(np.asarray(printable.bounds[1] - printable.bounds[0])) > 0:
+            # Editable geometry remains Y-up in metres. The slicer copy is
+            # Z-up, centred on the build plate and measured in millimetres.
+            printable.apply_transform(trimesh.transformations.rotation_matrix(np.pi / 2, [1, 0, 0]))
+            centre_xy = printable.bounds.mean(axis=0)
+            printable.apply_translation([-centre_xy[0], -centre_xy[1], -printable.bounds[0, 2]])
+            printable.apply_scale(1000.0)
+            path = self.output_dir / f"{self.session_id}_print_candidate_mm.stl"
+            printable.export(path)
+            exports.append(self._descriptor(path, "print_candidate_stl_millimetres"))
+        else:
+            validation["print_warning"] = "Mesh remains open or invalid; edit before printing"
+        atomic_write(self.output_dir / "mesh_validation.json",
+                     json.dumps(validation, indent=2).encode("utf-8"))
+        return exports, validation
+
+    def _descriptor(self, path, label):
+        url = f"/api/sessions/{self.session_id}/exports/{path.name}"
+        return {"filename": path.name, "format": path.suffix[1:].upper(),
+                "role": label, "path": str(path), "url": url,
+                "size_mb": round(path.stat().st_size / (1024 * 1024), 2)}
 
 
 class SimpleReconstruction:
-    """Simplified reconstruction using only depth maps (no COLMAP)."""
-
     @staticmethod
-    def reconstruct_from_depth_maps(session_dir: Path, session_id: str, custom_output_dir: Path = None, progress_cb=None) -> dict:
-        """Quick TSDF reconstruction from depth maps only."""
-        pipeline = ReconstructionPipeline(session_dir, session_id, custom_output_dir)
-        return pipeline.run_full_pipeline(use_colmap=False, progress_cb=progress_cb)
+    def reconstruct_from_depth_maps(session_dir, session_id, custom_output_dir=None, progress_cb=None):
+        return {"session_id": session_id, "status": "failed",
+                "error": "Registered, calibrated metric depth capture is not implemented; use COLMAP RGB reconstruction"}

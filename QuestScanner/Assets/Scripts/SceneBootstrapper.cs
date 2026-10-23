@@ -50,9 +50,7 @@ namespace MetaScan
             ObjectSelector objSelector = scanSystem.AddComponent<ObjectSelector>();
             ScanPointer scanPtr = scanSystem.AddComponent<ScanPointer>();
             CameraCapture camCapture = scanSystem.AddComponent<CameraCapture>();
-            DepthCapture depthCapture = scanSystem.AddComponent<DepthCapture>();
             DataStreamer streamer = scanSystem.AddComponent<DataStreamer>();
-            PointCloudVisualizer visualizer = scanSystem.AddComponent<PointCloudVisualizer>();
             VRUIPointer vrPointer = scanSystem.AddComponent<VRUIPointer>();
             ScanManager scanMgr = scanSystem.AddComponent<ScanManager>();
 

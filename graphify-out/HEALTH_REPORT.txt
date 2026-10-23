@@ -1,0 +1,41 @@
+[graphify] MultiDiGraph edge-collapse diagnostic
+input: <in-memory>
+input_stage: provided JSON (normal graph.json is post-build)
+effective_directed: <direct-call>
+nodes: 2790
+unverified_code_nodes: 0
+raw_edges: 6054
+valid_candidate_edges: 5911
+missing_endpoint_edges: 0
+dangling_endpoint_edges: 139
+external_reference_edges: 4
+self_loop_edges: 47
+exact_duplicate_edges: 0
+directed_unique_endpoint_pairs: 5719
+directed_same_endpoint_collapsed_edges: 192
+undirected_unique_endpoint_pairs: 5699
+undirected_same_endpoint_collapsed_edges: 212
+same_endpoint_group_count: 133
+relation_variant_groups: 74
+source_file_variant_groups: 0
+source_location_variant_groups: 59
+context_variant_groups: 11
+post_build_graph_type: Graph
+post_build_edges: 5842
+producer_suppression_sites: 12
+producer_suppression_examples:
+  - L1749 seen_ids arity=unknown
+  - L2282 seen_ids arity=unknown
+  - L2284 seen_doc_refs arity=unknown
+  - L2762 seen_ids arity=unknown
+  - L2909 seen_ids arity=unknown
+  - L3743 seen_keys arity=unknown
+  - L3916 seen_keys arity=unknown
+  - L6273 seen_ids arity=unknown
+examples:
+  - questscanner_assets_scripts_handuimanager_metascan_handuimanager -> text edges=8 relations=['references'] locations=['L46', 'L47', 'L48', 'L51', 'L58', 'L59', 'L60', 'L61'] contexts=['field']
+  - questscanner_packages_packages_lock -> questscanner_packages_packages_lock_json_ref_com_unity_modules_jsonserialize edges=8 relations=['imports'] locations=['L106', 'L115', 'L221', 'L322', 'L359', 'L375', 'L393', 'L482'] contexts=['import']
+  - questscanner_packages_packages_lock -> questscanner_packages_packages_lock_json_ref_com_unity_modules_unitywebrequest edges=7 relations=['imports'] locations=['L25', 'L392', 'L408', 'L416', 'L425', 'L434', 'L467'] contexts=['import']
+  - questscanner_packages_packages_lock -> questscanner_packages_packages_lock_json_ref_com_unity_modules_audio edges=6 relations=['imports'] locations=['L133', 'L22', 'L255', 'L417', 'L437', 'L465'] contexts=['import']
+  - questscanner_packages_packages_lock -> questscanner_packages_packages_lock_json_ref_com_unity_modules_physics edges=6 relations=['imports'] locations=['L135', 'L247', 'L336', 'L377', 'L457', 'L481'] contexts=['import']
+note: normal graph.json is post-build; raw producer loss must be measured earlier.

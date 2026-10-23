@@ -8,9 +8,12 @@ import hashlib
 import json
 import logging
 import math
+import os
 import shutil
 import subprocess
+import struct
 import time
+import uuid
 from pathlib import Path
 
 import cv2
@@ -32,6 +35,23 @@ STAGES = ("features", "matching", "mapper", "aligned", "alignment_text",
 
 class ReconstructionError(RuntimeError):
     pass
+
+
+def select_sparse_model(sparse: Path) -> Path:
+    """COLMAP model numbers are discovery order, not reconstruction quality."""
+    candidates = []
+    for model in sorted(sparse.iterdir()):
+        if not model.is_dir() or not (model / "points3D.bin").is_file():
+            continue
+        images = model / "images.bin"
+        if images.is_file():
+            with images.open("rb") as stream:
+                header = stream.read(8)
+            if len(header) == 8:
+                candidates.append((struct.unpack("<Q", header)[0], model))
+    if not candidates:
+        raise ReconstructionError("COLMAP produced no readable sparse model")
+    return max(candidates, key=lambda item: item[0])[1]
 
 
 def make_match_pairs(frames: list[dict], neighbors: int = 12, loops: int = 5) -> list[tuple[str, str]]:
@@ -60,7 +80,8 @@ def _safe_reset(path: Path, root: Path):
     if resolved == allowed or allowed not in resolved.parents or path.is_symlink():
         raise ReconstructionError("unsafe generated path")
     if path.exists():
-        shutil.rmtree(path)
+        # Keep incomplete/generated results available for diagnosis or recovery.
+        path.rename(path.with_name(path.name + ".preserved-" + uuid.uuid4().hex))
     path.mkdir(parents=True)
 
 
@@ -169,6 +190,12 @@ class ReconstructionPipeline:
             result = subprocess.run(args, capture_output=True, text=True,
                                     encoding="utf-8", errors="replace", timeout=timeout)
         except subprocess.TimeoutExpired as exc:
+            self.timings[name] = round(time.perf_counter() - started, 2)
+            def as_text(value):
+                return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else (value or "")
+            log_path = self.run_dir / f"{name}.timeout-{uuid.uuid4().hex}.log"
+            atomic_write(log_path, (as_text(exc.stdout) + "\n" + as_text(exc.stderr)).encode("utf-8"))
+            self.logs[name] = str(log_path)
             raise ReconstructionError(f"{name} timed out after {timeout}s") from exc
         elapsed = round(time.perf_counter() - started, 2)
         self.timings[name] = elapsed
@@ -297,6 +324,13 @@ class ReconstructionPipeline:
         ], 2400, mapper_ok, (model / "points3D.bin",))
         if not (model / "points3D.bin").is_file():
             raise ReconstructionError("COLMAP did not register a sparse model")
+        model = select_sparse_model(sparse)
+        selection_path = self.run_dir / "selected_sparse_model.txt"
+        previous = selection_path.read_text().strip() if selection_path.exists() else "0"
+        if previous != model.name:
+            for stage in STAGES[STAGES.index("aligned"):]:
+                (self.run_dir / f"{stage}.ok").unlink(missing_ok=True)
+        atomic_write(selection_path, model.name.encode("utf-8"))
 
         # COLMAP scale is arbitrary until its camera centres are aligned to
         # PCA physical camera positions. Flip world Z to keep Y up in a RH world.
@@ -336,13 +370,18 @@ class ReconstructionPipeline:
             "--output_type", "COLMAP", "--max_image_size", str(work_size),
         ], 600, undistort_ok, (dense / "images",))
         self._progress(68, "GPU dense stereo")
+        # Runtime depends on views and scene complexity. No arbitrary one-hour
+        # cutoff; operators may explicitly impose a positive deadline.
+        stereo_timeout = float(os.environ.get("METASCAN_STEREO_TIMEOUT_SECONDS", "0"))
+        if not math.isfinite(stereo_timeout) or stereo_timeout < 0:
+            raise ReconstructionError("METASCAN_STEREO_TIMEOUT_SECONDS must be finite and non-negative")
         self._step("stereo", [
             binary, "patch_match_stereo", "--workspace_path", str(dense),
             "--workspace_format", "COLMAP", "--PatchMatchStereo.geom_consistency", "true",
             "--PatchMatchStereo.max_image_size", str(work_size),
             "--PatchMatchStereo.num_iterations", str(stereo_iterations),
             "--PatchMatchStereo.num_samples", str(stereo_samples),
-        ], 3600, self.run_dir / "stereo.ok", (dense / "stereo" / "depth_maps",))
+        ], stereo_timeout or None, self.run_dir / "stereo.ok", (dense / "stereo" / "depth_maps",))
         fused = dense / "fused.ply"
         self._progress(83, "Dense point fusion")
         mask_dir = make_roi_masks(metadata, self.run_dir / "roi_masks")

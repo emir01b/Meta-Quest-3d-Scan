@@ -1,0 +1,272 @@
+{
+  "QuestScanner/Assets/Editor/BuildMetaScan.cs": {
+    "mtime": 1792760858.9054623,
+    "seen": 1792761693.006625,
+    "ast_hash": "00a5f2fa9a97a08daa7371237de6447e",
+    "semantic_hash": "00a5f2fa9a97a08daa7371237de6447e"
+  },
+  "QuestScanner/Assets/Scripts/CameraCapture.cs": {
+    "mtime": 1792760858.9156027,
+    "seen": 1792761693.006625,
+    "ast_hash": "40688aa78d033b0c71e3d5e4180d20e6",
+    "semantic_hash": "40688aa78d033b0c71e3d5e4180d20e6"
+  },
+  "QuestScanner/Assets/Scripts/ControllerManager.cs": {
+    "mtime": 1792760858.9156027,
+    "seen": 1792761693.006625,
+    "ast_hash": "b4dbf0022664c6c2c0463aa1a7335560",
+    "semantic_hash": "b4dbf0022664c6c2c0463aa1a7335560"
+  },
+  "QuestScanner/Assets/Scripts/DataStreamer.cs": {
+    "mtime": 1792760858.9166317,
+    "seen": 1792761693.006625,
+    "ast_hash": "a842e54b5e5536c4d38e9373ba52fb13",
+    "semantic_hash": "a842e54b5e5536c4d38e9373ba52fb13"
+  },
+  "QuestScanner/Assets/Scripts/DepthCapture.cs": {
+    "mtime": 1792760858.9166317,
+    "seen": 1792761693.006625,
+    "ast_hash": "25910d8d2df791ce7fbff2e0afb20ecb",
+    "semantic_hash": "25910d8d2df791ce7fbff2e0afb20ecb"
+  },
+  "QuestScanner/Assets/Scripts/HandUIManager.cs": {
+    "mtime": 1792760858.9181461,
+    "seen": 1792761693.006625,
+    "ast_hash": "9e3d2aee5a796c11390f90545c963087",
+    "semantic_hash": "9e3d2aee5a796c11390f90545c963087"
+  },
+  "QuestScanner/Assets/Scripts/MRSetup.cs": {
+    "mtime": 1792760858.9181461,
+    "seen": 1792761693.006625,
+    "ast_hash": "3a90326f77f29c3551341c1b6b7ae12f",
+    "semantic_hash": "3a90326f77f29c3551341c1b6b7ae12f"
+  },
+  "QuestScanner/Assets/Scripts/ObjectSelector.cs": {
+    "mtime": 1792760858.9191687,
+    "seen": 1792761693.006625,
+    "ast_hash": "9168354da69fad8300532bbf8df9860b",
+    "semantic_hash": "9168354da69fad8300532bbf8df9860b"
+  },
+  "QuestScanner/Assets/Scripts/PointCloudVisualizer.cs": {
+    "mtime": 1792760858.9191687,
+    "seen": 1792761693.006625,
+    "ast_hash": "49b1ada0b32ee5d5312a5d1727c570b5",
+    "semantic_hash": "49b1ada0b32ee5d5312a5d1727c570b5"
+  },
+  "QuestScanner/Assets/Scripts/ScanManager.cs": {
+    "mtime": 1792760858.9191687,
+    "seen": 1792761693.006625,
+    "ast_hash": "9a9af582fb330856b4391261532c1c94",
+    "semantic_hash": "9a9af582fb330856b4391261532c1c94"
+  },
+  "QuestScanner/Assets/Scripts/ScanPointer.cs": {
+    "mtime": 1792760858.9206805,
+    "seen": 1792761693.006625,
+    "ast_hash": "3014429c7c03f62efde55659e43c3427",
+    "semantic_hash": "3014429c7c03f62efde55659e43c3427"
+  },
+  "QuestScanner/Assets/Scripts/SceneBootstrapper.cs": {
+    "mtime": 1792760858.9216845,
+    "seen": 1792761693.006625,
+    "ast_hash": "b0d556eb187585360d739413f82cc6e7",
+    "semantic_hash": "b0d556eb187585360d739413f82cc6e7"
+  },
+  "QuestScanner/Assets/Scripts/VRUIPointer.cs": {
+    "mtime": 1792760858.9221878,
+    "seen": 1792761693.006625,
+    "ast_hash": "455d4734c1e304d28ce150b98e7b4b2e",
+    "semantic_hash": "455d4734c1e304d28ce150b98e7b4b2e"
+  },
+  "QuestScanner/Assets/XR/APILayers~/WindowsLayers/x64/XrApiLayer_METAX_operator.json": {
+    "mtime": 1792761262.3426516,
+    "seen": 1792761693.006625,
+    "ast_hash": "523645a0f8873863fc5944f976f272e8",
+    "semantic_hash": "523645a0f8873863fc5944f976f272e8"
+  },
+  "QuestScanner/Packages/manifest.json": {
+    "mtime": 1792760858.9319956,
+    "seen": 1792761693.006625,
+    "ast_hash": "28840f2e1be0fcd53be005d22279cf74",
+    "semantic_hash": "28840f2e1be0fcd53be005d22279cf74"
+  },
+  "QuestScanner/Packages/packages-lock.json": {
+    "mtime": 1792760858.9319956,
+    "seen": 1792761693.006625,
+    "ast_hash": "689274fdbf22274ad81ae69d3d3d8c10",
+    "semantic_hash": "689274fdbf22274ad81ae69d3d3d8c10"
+  },
+  "QuestScanner/ProjectSettings/SceneTemplateSettings.json": {
+    "mtime": 1792760858.9392955,
+    "seen": 1792761693.006625,
+    "ast_hash": "3620a2b0a1c79cc4ae4b6b6ad599ff4d",
+    "semantic_hash": "3620a2b0a1c79cc4ae4b6b6ad599ff4d"
+  },
+  "server/config.py": {
+    "mtime": 1792760861.7877443,
+    "seen": 1792761693.006625,
+    "ast_hash": "6e1020a315ef9f87f5bb4f3e53561574",
+    "semantic_hash": "6e1020a315ef9f87f5bb4f3e53561574"
+  },
+  "server/frame_handler.py": {
+    "mtime": 1792760861.788255,
+    "seen": 1792761693.006625,
+    "ast_hash": "aac6e3a1fcf2643ef7c064fdd866b177",
+    "semantic_hash": "aac6e3a1fcf2643ef7c064fdd866b177"
+  },
+  "server/main.py": {
+    "mtime": 1792760861.7887642,
+    "seen": 1792761693.006625,
+    "ast_hash": "e94e5f5a75a1f185957ede54c22fa051",
+    "semantic_hash": "e94e5f5a75a1f185957ede54c22fa051"
+  },
+  "server/protocol.py": {
+    "mtime": 1792760861.7892737,
+    "seen": 1792761693.006625,
+    "ast_hash": "cc4deb3f32385f29bf519abf51e8e03a",
+    "semantic_hash": "cc4deb3f32385f29bf519abf51e8e03a"
+  },
+  "server/reconstruction.py": {
+    "mtime": 1792760861.789788,
+    "seen": 1792761693.006625,
+    "ast_hash": "39972acec03a82435db7b63751d24d33",
+    "semantic_hash": "39972acec03a82435db7b63751d24d33"
+  },
+  "server/tests/colmap_alignment_smoke.py": {
+    "mtime": 1792760861.7902906,
+    "seen": 1792761693.006625,
+    "ast_hash": "314fc00f2790dcfe2ab079f010d125dc",
+    "semantic_hash": "314fc00f2790dcfe2ab079f010d125dc"
+  },
+  "server/tests/colmap_smoke.py": {
+    "mtime": 1792760861.7919364,
+    "seen": 1792761693.006625,
+    "ast_hash": "b37f9ddd53e24d332333c2db19090fd0",
+    "semantic_hash": "b37f9ddd53e24d332333c2db19090fd0"
+  },
+  "server/tests/test_scan_contract.py": {
+    "mtime": 1792760861.7919364,
+    "seen": 1792761693.006625,
+    "ast_hash": "7ab79efb4dcb8945cea617c73adf1d99",
+    "semantic_hash": "7ab79efb4dcb8945cea617c73adf1d99"
+  },
+  "server/tests/viewer_smoke.js": {
+    "mtime": 1792760861.7919364,
+    "seen": 1792761693.006625,
+    "ast_hash": "d3a7b50e8d9ee3e84d8422838847147c",
+    "semantic_hash": "d3a7b50e8d9ee3e84d8422838847147c"
+  },
+  "viewer/js/GLTFLoader.js": {
+    "mtime": 1792760861.7949643,
+    "seen": 1792761693.006625,
+    "ast_hash": "6c64e36140357a624eb6b1c98c269448",
+    "semantic_hash": "6c64e36140357a624eb6b1c98c269448"
+  },
+  "viewer/js/MTLLoader.js": {
+    "mtime": 1792760861.7954783,
+    "seen": 1792761693.006625,
+    "ast_hash": "2dd565b231f0f9e38202691b29ce2898",
+    "semantic_hash": "2dd565b231f0f9e38202691b29ce2898"
+  },
+  "viewer/js/OBJExporter.js": {
+    "mtime": 1792760861.7966821,
+    "seen": 1792761693.006625,
+    "ast_hash": "a38981dcca294c9c7a86e1e7fe90bc13",
+    "semantic_hash": "a38981dcca294c9c7a86e1e7fe90bc13"
+  },
+  "viewer/js/OBJLoader.js": {
+    "mtime": 1792760861.7971961,
+    "seen": 1792761693.006625,
+    "ast_hash": "a7f317f427bfecd9d78fed462e842f77",
+    "semantic_hash": "a7f317f427bfecd9d78fed462e842f77"
+  },
+  "viewer/js/OrbitControls.js": {
+    "mtime": 1792760861.7971961,
+    "seen": 1792761693.006625,
+    "ast_hash": "f0d5ef9abdb36bcdcd5495370c842604",
+    "semantic_hash": "f0d5ef9abdb36bcdcd5495370c842604"
+  },
+  "viewer/js/PLYLoader.js": {
+    "mtime": 1792760861.7987072,
+    "seen": 1792761693.006625,
+    "ast_hash": "6d36f6f8aa432703c1d9ab87cfea40b6",
+    "semantic_hash": "6d36f6f8aa432703c1d9ab87cfea40b6"
+  },
+  "viewer/js/STLExporter.js": {
+    "mtime": 1792760861.7987072,
+    "seen": 1792761693.006625,
+    "ast_hash": "a7997bb0c03982c4542fabd2de9c760c",
+    "semantic_hash": "a7997bb0c03982c4542fabd2de9c760c"
+  },
+  "viewer/js/STLLoader.js": {
+    "mtime": 1792760861.7987072,
+    "seen": 1792761693.006625,
+    "ast_hash": "6ebd027a0cae71fba914916c1d95003e",
+    "semantic_hash": "6ebd027a0cae71fba914916c1d95003e"
+  },
+  "viewer/js/three.min.js": {
+    "mtime": 1792760861.8017316,
+    "seen": 1792761693.006625,
+    "ast_hash": "8524cd01c45671cc93ea6ab9e73494e7",
+    "semantic_hash": "8524cd01c45671cc93ea6ab9e73494e7"
+  },
+  "QuestScanner/ProjectSettings/ProjectVersion.txt": {
+    "mtime": 1792760858.9387696,
+    "seen": 1792761693.006625,
+    "ast_hash": "c2c33db37a6c3fb46288d0c1fd351736",
+    "semantic_hash": "c2c33db37a6c3fb46288d0c1fd351736"
+  },
+  "README.md": {
+    "mtime": 1792760858.9418318,
+    "seen": 1792761693.006625,
+    "ast_hash": "30c0f2a4dabeb96ea8c2c5f3d40ee687",
+    "semantic_hash": "30c0f2a4dabeb96ea8c2c5f3d40ee687"
+  },
+  "docs/GERCEK_TARAMA_2026-10-23.md": {
+    "mtime": 1792760858.9423416,
+    "seen": 1792761693.006625,
+    "ast_hash": "13a482a8b44168253888a1598a392271",
+    "semantic_hash": "13a482a8b44168253888a1598a392271"
+  },
+  "docs/METASCAN_NIHAI_TEKNIK_RAPOR_2026-10-22.md": {
+    "mtime": 1792760858.9423416,
+    "seen": 1792761693.006625,
+    "ast_hash": "366adf9ce1fccbcc63dd6b5d01fc52ac",
+    "semantic_hash": "366adf9ce1fccbcc63dd6b5d01fc52ac"
+  },
+  "docs/QUEST_3S_KABUL_TESTI.md": {
+    "mtime": 1792760858.943368,
+    "seen": 1792761693.006625,
+    "ast_hash": "4a14a3073a9a6b9db893305d4858cc63",
+    "semantic_hash": "4a14a3073a9a6b9db893305d4858cc63"
+  },
+  "docs/STEREO_VE_HIZ_ARASTIRMASI_2026-10-23.md": {
+    "mtime": 1792760858.943368,
+    "seen": 1792761693.006625,
+    "ast_hash": "507a8e3df221b647300929e2b92ba492",
+    "semantic_hash": "507a8e3df221b647300929e2b92ba492"
+  },
+  "docs/UNITY_6000_6_GECIS_DOGRULAMA.md": {
+    "mtime": 1792760858.943368,
+    "seen": 1792761693.006625,
+    "ast_hash": "274481548d4d5fdec5d04ffc52420276",
+    "semantic_hash": "274481548d4d5fdec5d04ffc52420276"
+  },
+  "server/requirements-dev.txt": {
+    "mtime": 1792760861.7902906,
+    "seen": 1792761693.006625,
+    "ast_hash": "a408cce7b3abe35ed03175e9a47a5e15",
+    "semantic_hash": "a408cce7b3abe35ed03175e9a47a5e15"
+  },
+  "server/requirements.txt": {
+    "mtime": 1792760861.7902906,
+    "seen": 1792761693.006625,
+    "ast_hash": "ca2a01a723b444c0a4731d160120f796",
+    "semantic_hash": "ca2a01a723b444c0a4731d160120f796"
+  },
+  "viewer/index.html": {
+    "mtime": 1792760861.7934523,
+    "seen": 1792761693.006625,
+    "ast_hash": "733f99f92a688eb45b9cbc2616fe88a9",
+    "semantic_hash": "733f99f92a688eb45b9cbc2616fe88a9"
+  }
+}
